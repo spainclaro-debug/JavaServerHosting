@@ -3,10 +3,16 @@ package dev.javahost.ui.screens
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -15,6 +21,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -25,10 +32,14 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalUriHandler
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import dev.javahost.core.model.ExitInfo
+import dev.javahost.core.model.LanEndpointInfo
+import dev.javahost.core.model.LanProbeInfo
 import dev.javahost.core.model.RunState
 import dev.javahost.core.model.ServerInstance
 import dev.javahost.ui.AppActions
@@ -49,6 +60,7 @@ import dev.javahost.ui.components.formatMegabytes
 import dev.javahost.ui.components.formatTimestamp
 import dev.javahost.ui.components.formatUptime
 import dev.javahost.ui.theme.Danger
+import dev.javahost.ui.theme.TealGreen
 import dev.javahost.ui.theme.WarnAmber
 
 private const val DETAIL_EULA_URL = "https://aka.ms/MinecraftEULA"
@@ -200,6 +212,92 @@ fun ServerDetailScreen(
                 MessageBanner("Java ${live.jreMajor} is not installed. Servers cannot start until it is.", isError = true)
                 OutlinedButton(onClick = onOpenJre, modifier = Modifier.fillMaxWidth()) {
                     Text("Open Java runtimes")
+                }
+            }
+
+            /* ---------------- LAN access ---------------- */
+            SectionCard(
+                title = "LAN access",
+                subtitle = if (isThisActive) "How other devices on your network can connect" else null
+            ) {
+                if (isThisActive) {
+                    val lan = runtime.lan
+                    if (lan.endpoints.isEmpty()) {
+                        Text(
+                            "No private LAN address found yet. Use Wi-Fi or a hotspot — mobile data and " +
+                                "VPN connections cannot be reached by other devices.",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    } else {
+                        lan.endpoints.forEach { endpoint ->
+                            LanEndpointRow(endpoint = endpoint, showUrl = !live.isMinecraft)
+                        }
+                    }
+                    lan.warning?.let { warning ->
+                        Text(
+                            warning,
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = WarnAmber
+                        )
+                    }
+                    lan.summary?.let { summary ->
+                        Text(summary, style = MaterialTheme.typography.bodyMedium)
+                    }
+                    OutlinedButton(
+                        onClick = { actions.probeLan() },
+                        modifier = Modifier.fillMaxWidth()
+                    ) { Text("Test LAN reachability") }
+                    if (lan.probes.isNotEmpty()) {
+                        Text("Self-test results", style = MaterialTheme.typography.labelLarge)
+                        lan.probes.forEach { probe -> LanProbeResultRow(probe) }
+                        Text(
+                            "The test runs from this phone, so a green result means the server is " +
+                                "listening on that address. If another device still cannot connect, " +
+                                "check router AP/client isolation, the guest network, or that device's " +
+                                "firewall.",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                } else {
+                    Text(
+                        "Start the server to see the LAN address clients should use.",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+
+                if (live.isMinecraft) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text("Announce on the LAN (auto-discovery)", style = MaterialTheme.typography.bodyLarge)
+                            Text(
+                                "Makes this server appear in Minecraft's LAN list when the client is on " +
+                                    "the same Wi-Fi network or hotspot.",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        Switch(
+                            checked = state.settings.minecraftLanDiscovery,
+                            onCheckedChange = actions::setMinecraftLanDiscovery
+                        )
+                    }
+                    Text(
+                        "Clients must be on the same Wi-Fi/hotspot; mobile data and VPNs usually block LAN " +
+                            "traffic. If you edited server.properties, leave server-ip empty so the server " +
+                            "listens on all interfaces.",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                } else {
+                    Text(
+                        "Other devices must be on the same Wi-Fi network or hotspot. Mobile data and VPNs " +
+                            "usually block incoming LAN connections.",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
                 }
             }
 
@@ -480,5 +578,89 @@ fun ServerDetailScreen(
                 TextButton(onClick = { showRename = false }) { Text("Cancel") }
             }
         )
+    }
+}
+
+/* -------------------------------------------------------------------------- */
+/* LAN access pieces                                                           */
+/* -------------------------------------------------------------------------- */
+
+@Composable
+private fun LanEndpointRow(endpoint: LanEndpointInfo, showUrl: Boolean) {
+    val clipboard = LocalClipboardManager.current
+    // Generic servers are usually opened in a browser, so copy the full URL;
+    // Minecraft clients take "address:port" directly.
+    val copyText = endpoint.url ?: endpoint.hostPort ?: endpoint.address
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(10.dp),
+        color = MaterialTheme.colorScheme.surfaceVariant
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    endpoint.hostPort ?: endpoint.address,
+                    style = MaterialTheme.typography.bodyLarge
+                )
+                Text(
+                    "${endpoint.label} · ${endpoint.interfaceName}",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                if (showUrl) {
+                    endpoint.url?.let { url ->
+                        Text(
+                            url,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = TealGreen
+                        )
+                    }
+                }
+            }
+            TextButton(onClick = { clipboard.setText(AnnotatedString(copyText)) }) {
+                Text("Copy")
+            }
+        }
+    }
+}
+
+@Composable
+private fun LanProbeResultRow(probe: LanProbeInfo) {
+    val color = if (probe.ok) TealGreen else Danger
+    Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+        Icon(
+            imageVector = if (probe.ok) Icons.Default.CheckCircle else Icons.Default.Warning,
+            contentDescription = null,
+            tint = color,
+            modifier = Modifier.size(18.dp)
+        )
+        Spacer(Modifier.width(8.dp))
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                "${probe.address}:${probe.port}",
+                style = MaterialTheme.typography.bodyMedium
+            )
+            Text(
+                if (probe.ok) {
+                    probe.latencyMs?.let { "reachable · $it ms" } ?: "reachable"
+                } else {
+                    "not reachable · ${probe.result.replace('_', ' ')}"
+                },
+                style = MaterialTheme.typography.labelSmall,
+                color = color
+            )
+            if (!probe.ok) {
+                probe.detail?.let { detail ->
+                    Text(
+                        detail,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
+        }
     }
 }

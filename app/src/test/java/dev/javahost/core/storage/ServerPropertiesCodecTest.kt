@@ -1,6 +1,7 @@
 package dev.javahost.core.storage
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
@@ -224,5 +225,145 @@ class ServerPropertiesCodecTest {
         assertThrows(java.io.IOException::class.java) {
             ServerPropertiesCodec.read(file, maxBytes = 128)
         }
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* server-ip (bind address) helpers                                   */
+    /* ------------------------------------------------------------------ */
+
+    @Test
+    fun `server-ip is a known key`() {
+        assertEquals("server-ip", ServerPropertiesCodec.SERVER_IP)
+        assertTrue(ServerPropertiesCodec.KNOWN_KEYS.contains(ServerPropertiesCodec.SERVER_IP))
+        assertEquals(ServerPropertiesCodec.KNOWN_KEYS.last(), ServerPropertiesCodec.SERVER_IP)
+    }
+
+    @Test
+    fun `serverIp getter trims and treats blank values`() {
+        assertEquals(
+            "192.168.1.50",
+            ServerPropertiesCodec.serverIp(mapOf(ServerPropertiesCodec.SERVER_IP to " 192.168.1.50 "))
+        )
+        assertEquals("", ServerPropertiesCodec.serverIp(mapOf(ServerPropertiesCodec.SERVER_IP to "   ")))
+        assertNull(ServerPropertiesCodec.serverIp(emptyMap()))
+    }
+
+    @Test
+    fun `setServerIp accepts blank ipv4 ipv6 and host names`() {
+        val entries = linkedMapOf<String, String>()
+        ServerPropertiesCodec.setServerIp(entries, "   ")
+        assertEquals("", entries[ServerPropertiesCodec.SERVER_IP])
+        ServerPropertiesCodec.setServerIp(entries, " 0.0.0.0 ")
+        assertEquals("0.0.0.0", entries[ServerPropertiesCodec.SERVER_IP])
+        ServerPropertiesCodec.setServerIp(entries, "javahost.local")
+        assertEquals("javahost.local", entries[ServerPropertiesCodec.SERVER_IP])
+        ServerPropertiesCodec.setServerIp(entries, "fe80::1")
+        assertEquals("fe80::1", entries[ServerPropertiesCodec.SERVER_IP])
+    }
+
+    @Test
+    fun `setServerIp rejects separators whitespace and line breaks`() {
+        val invalid = listOf(
+            "192.168.1.5 = 1",
+            "192.168.1.5 2",
+            "line\nbreak",
+            "line\rbreak",
+            "host name",
+            "server-ip=1",
+            "192.168.1.5 # comment",
+            "caf\u00e9"
+        )
+        for (value in invalid) {
+            assertThrows(IllegalArgumentException::class.java) {
+                ServerPropertiesCodec.setServerIp(linkedMapOf(), value)
+            }
+        }
+        // A rejected value must not corrupt the map.
+        val entries = linkedMapOf(ServerPropertiesCodec.SERVER_IP to "192.168.1.5")
+        assertThrows(IllegalArgumentException::class.java) {
+            ServerPropertiesCodec.setServerIp(entries, "bad value")
+        }
+        assertEquals("192.168.1.5", entries[ServerPropertiesCodec.SERVER_IP])
+    }
+
+    @Test
+    fun `setServerIp keeps loopback values until they are normalized`() {
+        val entries = linkedMapOf<String, String>()
+        ServerPropertiesCodec.setServerIp(entries, "127.0.0.1")
+        assertEquals("127.0.0.1", entries[ServerPropertiesCodec.SERVER_IP])
+        assertTrue(ServerPropertiesCodec.isLoopbackBind(entries[ServerPropertiesCodec.SERVER_IP]))
+    }
+
+    @Test
+    fun `isLoopbackBind recognizes loopback only`() {
+        assertTrue(ServerPropertiesCodec.isLoopbackBind("127.0.0.1"))
+        assertTrue(ServerPropertiesCodec.isLoopbackBind("127.255.255.254"))
+        assertTrue(ServerPropertiesCodec.isLoopbackBind(" ::1 "))
+        assertTrue(ServerPropertiesCodec.isLoopbackBind("localhost"))
+        assertTrue(ServerPropertiesCodec.isLoopbackBind("LOCALHOST"))
+
+        assertFalse(ServerPropertiesCodec.isLoopbackBind(null))
+        assertFalse(ServerPropertiesCodec.isLoopbackBind(""))
+        assertFalse(ServerPropertiesCodec.isLoopbackBind("   "))
+        assertFalse(ServerPropertiesCodec.isLoopbackBind("0.0.0.0"))
+        assertFalse(ServerPropertiesCodec.isLoopbackBind("10.0.0.1"))
+        assertFalse(ServerPropertiesCodec.isLoopbackBind("128.0.0.1"))
+        assertFalse(ServerPropertiesCodec.isLoopbackBind("::2"))
+        assertFalse(ServerPropertiesCodec.isLoopbackBind("localhost.example.com"))
+        // Not a full dotted-quad, so not recognized as a loopback bind.
+        assertFalse(ServerPropertiesCodec.isLoopbackBind("127.0.0"))
+        assertFalse(ServerPropertiesCodec.isLoopbackBind("127.0.0.1.5"))
+    }
+
+    @Test
+    fun `normalizeBindAddress clears blank and loopback binds`() {
+        assertEquals("", ServerPropertiesCodec.normalizeBindAddress(null))
+        assertEquals("", ServerPropertiesCodec.normalizeBindAddress(""))
+        assertEquals("", ServerPropertiesCodec.normalizeBindAddress("   "))
+        assertEquals("", ServerPropertiesCodec.normalizeBindAddress("127.0.0.1"))
+        assertEquals("", ServerPropertiesCodec.normalizeBindAddress(" localhost "))
+        assertEquals("", ServerPropertiesCodec.normalizeBindAddress("::1"))
+        assertEquals("192.168.1.50", ServerPropertiesCodec.normalizeBindAddress(" 192.168.1.50 "))
+        assertEquals("0.0.0.0", ServerPropertiesCodec.normalizeBindAddress("0.0.0.0"))
+        assertEquals("fe80::1", ServerPropertiesCodec.normalizeBindAddress(" fe80::1 "))
+    }
+
+    @Test
+    fun `format updates server-ip in place and preserves other lines`() {
+        val raw = "# bind address\nmotd=Hello\nserver-ip=127.0.0.1\nonline-mode=true\n"
+        val entries = ServerPropertiesCodec.parse(raw).toMutableMap()
+        ServerPropertiesCodec.setServerIp(entries, "")
+        assertEquals(
+            "# bind address\nmotd=Hello\nserver-ip=\nonline-mode=true\n",
+            ServerPropertiesCodec.format(entries, raw)
+        )
+    }
+
+    @Test
+    fun `format appends server-ip when the key is new`() {
+        val raw = "# hand written\nmotd=Old\n"
+        val entries = ServerPropertiesCodec.parse(raw).toMutableMap()
+        ServerPropertiesCodec.setServerIp(entries, "192.168.1.50")
+        assertEquals(
+            "# hand written\nmotd=Old\nserver-ip=192.168.1.50\n",
+            ServerPropertiesCodec.format(entries, raw)
+        )
+    }
+
+    @Test
+    fun `server-ip round trip is byte stable`() {
+        val raw = "server-ip=192.168.1.50\n# tail\n"
+        val parsed = ServerPropertiesCodec.parse(raw)
+        assertEquals("192.168.1.50", ServerPropertiesCodec.serverIp(parsed))
+        assertEquals(raw, ServerPropertiesCodec.format(parsed, raw))
+    }
+
+    @Test
+    fun `normalized loopback bind is written as all interfaces`() {
+        val raw = "server-ip=localhost\nmotd=Hi\n"
+        val entries = ServerPropertiesCodec.parse(raw).toMutableMap()
+        entries[ServerPropertiesCodec.SERVER_IP] =
+            ServerPropertiesCodec.normalizeBindAddress(entries[ServerPropertiesCodec.SERVER_IP])
+        assertEquals("server-ip=\nmotd=Hi\n", ServerPropertiesCodec.format(entries, raw))
     }
 }

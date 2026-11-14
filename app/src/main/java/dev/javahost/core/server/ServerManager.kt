@@ -2,6 +2,7 @@ package dev.javahost.core.server
 
 import android.app.ActivityManager
 import android.content.Context
+import android.os.PowerManager
 import android.system.Os
 import android.system.OsConstants
 import dev.javahost.core.api.JreController
@@ -12,6 +13,9 @@ import dev.javahost.core.launch.LaunchPlanBuilder
 import dev.javahost.core.model.ConsoleEntry
 import dev.javahost.core.model.ExitInfo
 import dev.javahost.core.model.ExitReason
+import dev.javahost.core.model.LanEndpointInfo
+import dev.javahost.core.model.LanProbeInfo
+import dev.javahost.core.model.LanStatus
 import dev.javahost.core.model.InspectionResult
 import dev.javahost.core.model.LogLevel
 import dev.javahost.core.model.RunState
@@ -19,6 +23,14 @@ import dev.javahost.core.model.ServerFlavor
 import dev.javahost.core.model.ServerInstance
 import dev.javahost.core.model.ServerRuntimeStatus
 import dev.javahost.core.model.StartResult
+import dev.javahost.core.net.AndroidLanInfo
+import dev.javahost.core.net.LanEndpoint
+import dev.javahost.core.net.LanNetworkState
+import dev.javahost.core.net.LanProbeResult
+import dev.javahost.core.net.MinecraftLanAnnouncement
+import dev.javahost.core.net.MinecraftLanAnnouncer
+import dev.javahost.core.net.SocketTcpProbe
+import dev.javahost.core.net.TcpProbe
 import dev.javahost.core.storage.InstanceStore
 import dev.javahost.core.storage.Paths
 import dev.javahost.core.storage.ServerPropertiesCodec
@@ -142,6 +154,12 @@ class ServerManager(
 
     private var restartJob: Job? = null
 
+    // ---- LAN access / Minecraft discovery --------------------------------
+    private val lanInfo = AndroidLanInfo(appContext)
+    private val tcpProbe: TcpProbe = SocketTcpProbe()
+    private var lanAnnouncer: MinecraftLanAnnouncer? = null
+    private val lanProbeInFlight = AtomicBoolean(false)
+
     // =====================================================================
     // Contract: start
     // =====================================================================
@@ -242,6 +260,11 @@ class ServerManager(
             runCatching { EulaManager.accept(paths, instanceId) }
         }
 
+        // 3b. LAN bind address: a leftover loopback `server-ip` (or a server
+        // record with a phone-only address) makes localhost work while every
+        // other device gets "connection refused". Clear it before launch.
+        normalizeMinecraftBindAddress(instance)
+
         // 4. Memory.
         val memoryMb = LaunchPlanBuilder.resolvedMemoryMb(
             instance,
@@ -281,7 +304,7 @@ class ServerManager(
         runCatching { logTail.startSession() }
         emitJarTypeWarning(instance, canonicalJar)
         emitMinecraftLoadDiagnostics(instance)
-        emitLanAddress(instance)
+        emitLanOverview(instance)
 
         val startedAt = System.currentTimeMillis()
         val process: Process = try {
@@ -350,6 +373,9 @@ class ServerManager(
         activeSession.readerJob = scope.launch { readerLoop(activeSession) }
         activeSession.waitJob = scope.launch { waitLoop(activeSession) }
         activeSession.statsJob = scope.launch { statsLoop(activeSession) }
+        scope.launch {
+            runCatching { refreshLan(activeSession, probe = false) }
+        }
         return StartResult.Ok
     }
 
@@ -483,6 +509,25 @@ class ServerManager(
 
     override fun activeLastCrash(): ExitInfo? = lastCrash
 
+    override fun probeLan(): Boolean {
+        val current = synchronized(lock) { session } ?: return false
+        if (!current.ready) {
+            emitConsole(
+                LogLevel.INFO,
+                "The server is still starting; the LAN self-test runs automatically once it is ready."
+            )
+        }
+        if (!lanProbeInFlight.compareAndSet(false, true)) return true
+        scope.launch {
+            try {
+                runCatching { refreshLan(current, probe = true, forceReport = true) }
+            } finally {
+                lanProbeInFlight.set(false)
+            }
+        }
+        return true
+    }
+
     override fun forceStop(): Boolean {
         restartJob?.cancel()
         restartJob = null
@@ -496,6 +541,7 @@ class ServerManager(
         current.stopRequested = true
         current.forceRequested = true
         current.stopInitiated.set(true)
+        stopLanAnnouncement(current)
         forceKill(current)
         val exited = runCatching { current.process.waitFor(2, TimeUnit.SECONDS) }.getOrDefault(false)
         val code = if (exited) runCatching { current.process.exitValue() }.getOrDefault(-1) else -1
@@ -533,6 +579,7 @@ class ServerManager(
         if (current != null) {
             current.stopRequested = true
             current.forceRequested = true
+            stopLanAnnouncement(current)
             // Prevent waitLoop from running the normal post-mortem path; this is
             // an app shutdown, not a server crash.
             current.finalized.set(true)
@@ -739,6 +786,13 @@ class ServerManager(
     private fun markReady(session: Session) {
         if (session.ready || session.finalized.get()) return
         session.ready = true
+        // The server is actually listening now: start the Minecraft LAN
+        // discovery announcement and run the reachability self-test.
+        scope.launch {
+            runCatching { startLanAnnouncement(session) }
+            delay(LAN_READY_SETTLE_MS)
+            runCatching { refreshLan(session, probe = true, forceReport = true) }
+        }
         _runtime.update { status ->
             if (status.instanceId != session.instanceId || !isActiveState(status.state)) return@update status
             status.copy(
@@ -862,6 +916,10 @@ class ServerManager(
                     ready = session.ready
                 )
             }
+            if (session.ready && now - session.lanRefreshAt >= LAN_REFRESH_INTERVAL_MS) {
+                runCatching { refreshLan(session, probe = false) }
+                runCatching { reconcileLanAnnouncement(session) }
+            }
             delay(STATS_INTERVAL_MS)
         }
     }
@@ -984,52 +1042,69 @@ class ServerManager(
         }
     }
 
+    // =====================================================================
+    // LAN access / Minecraft discovery
+    // =====================================================================
+
     /**
-     * Prints the address clients should use. Android Wi-Fi commonly blocks the
-     * multicast used by Minecraft's LAN discovery, so the server can be running
-     * yet not "show up"; manually adding this address is the reliable path.
+     * Prints the LAN addresses clients can use *before* the server is spawned
+     * and explains connectivity problems (no Wi-Fi, VPN, mobile data).
+     *
+     * Only Wi-Fi / ethernet / hotspot interfaces with a private IPv4 address
+     * are used: cellular (`ccmni*`, `rmnet*`) and VPN (`tun*`) addresses are
+     * not reachable from the user's LAN, which was the original bug.
      */
-    private fun emitLanAddress(instance: ServerInstance) {
-        val port = if (instance.isMinecraft) {
-            runCatching {
-                ServerPropertiesCodec.port(
-                    ServerPropertiesCodec.read(paths.serverProperties(instance.id))
-                )
-            }.getOrNull() ?: instance.serverPort ?: 25565
-        } else {
-            instance.serverPort
-        }
-        val ip = runCatching {
-            java.util.Collections.list(NetworkInterface.getNetworkInterfaces()).asSequence()
-                .filter { it.isUp && !it.isLoopback }
-                .flatMap { it.inetAddresses.asSequence() }
-                .filterIsInstance<Inet4Address>()
-                .firstOrNull { it.isSiteLocalAddress }
-                ?.hostAddress
-        }.getOrNull()
-        if (ip != null) {
-            if (port != null) {
-                emitConsole(
-                    LogLevel.INFO,
-                    "LAN address: $ip:$port — connect clients to this address if auto-discovery " +
-                        "does not list the server. Phone and client must be on the same Wi-Fi/hotspot; " +
-                        "Android often blocks LAN multicast discovery."
-                )
-            } else {
-                emitConsole(
-                    LogLevel.INFO,
-                    "LAN address: $ip — use the port reported later in this console. Phone and " +
-                        "client must be on the same Wi-Fi/hotspot."
-                )
-            }
-        } else {
+    private fun emitLanOverview(instance: ServerInstance) {
+        val endpoints = runCatching { lanInfo.endpoints() }.getOrDefault(emptyList())
+        val network = runCatching { lanInfo.networkState() }.getOrNull()
+        val port = resolveLanPort(instance, null)
+        if (endpoints.isEmpty()) {
             emitConsole(
                 LogLevel.WARN,
-                "No Wi-Fi IPv4 address found. Connect the phone to Wi-Fi/hotspot before clients try to connect." +
-                    (port?.let { " (port $it)" } ?: "")
+                "LAN access: no usable LAN address. ${buildNoLanWarning(network)}"
+            )
+        } else {
+            for (endpoint in endpoints) {
+                val shown = if (instance.isMinecraft) {
+                    port?.let { endpoint.hostPort(it) } ?: endpoint.address
+                } else {
+                    port?.let { endpoint.httpUrl(it) } ?: endpoint.address
+                }
+                emitConsole(
+                    LogLevel.INFO,
+                    "LAN address: $shown (${endpoint.label}, ${endpoint.interfaceName})"
+                )
+            }
+            if (endpoints.size > 1) {
+                emitConsole(
+                    LogLevel.INFO,
+                    "Multiple LAN interfaces found. Use the address of the network your client " +
+                        "device is connected to; all of them are listed in the server's LAN card."
+                )
+            }
+        }
+        if (network?.vpnActive == true) {
+            emitConsole(
+                LogLevel.WARN,
+                "A VPN is active. VPNs often block incoming LAN connections; turn the VPN off " +
+                    "while hosting and try again."
             )
         }
         if (!instance.isMinecraft) return
+
+        emitConsole(
+            LogLevel.INFO,
+            "Minecraft dedicated servers do not appear in the LAN list by themselves. JavaHost " +
+                "announces this server over multicast once it is ready (Settings -> Minecraft LAN " +
+                "discovery announcement). If it still is not listed, use Add Server manually."
+        )
+        if (port != null && endpoints.isNotEmpty()) {
+            emitConsole(
+                LogLevel.INFO,
+                "Minecraft: add server ${endpoints.first().hostPort(port)} if it is not listed automatically."
+            )
+        }
+
         val hasGeyser = runCatching {
             paths.pluginsDir(instance.id).listFiles { f ->
                 f.isFile && f.extension.equals("jar", true) && f.name.contains("geyser", true)
@@ -1038,11 +1113,354 @@ class ServerManager(
         if (hasGeyser) {
             emitConsole(
                 LogLevel.INFO,
-                "Geyser/Bedrock: connect Bedrock clients to ${ip ?: "<phone-ip>"}:19132 (UDP). " +
+                "Geyser/Bedrock: connect Bedrock clients to ${endpoints.firstOrNull()?.address ?: "<phone-ip>"}:19132 (UDP). " +
                     "For Bedrock, install Floodgate for Paper from geysermc.org (Modrinth's Floodgate " +
                     "is Fabric/NeoForge only) and restart."
             )
         }
+    }
+
+    /**
+     * Recomputes [LanStatus] for the active session (addresses, port, phone
+     * connectivity, optional TCP self-test) and publishes it to the runtime so
+     * the UI's LAN card stays current. Never throws.
+     */
+    private suspend fun refreshLan(session: Session, probe: Boolean, forceReport: Boolean = false) {
+        if (session.finalized.get()) return
+        val instance = instances.get(session.instanceId) ?: return
+        val network = withContext(Dispatchers.IO) {
+            runCatching { lanInfo.networkState() }.getOrNull()
+        }
+        val endpoints = withContext(Dispatchers.IO) {
+            runCatching { lanInfo.endpoints() }.getOrDefault(emptyList())
+        }
+        val port = resolveLanPort(instance, session)
+        var warning: String? = if (endpoints.isEmpty()) buildNoLanWarning(network) else null
+        if (network?.vpnActive == true) {
+            warning = listOfNotNull(
+                warning,
+                "A VPN is active; VPNs commonly block incoming LAN connections."
+            ).joinToString(" ")
+        }
+        if (warning == null && endpoints.size > 1) {
+            warning = "Several LAN addresses exist. Pick the one on the same network as the client device."
+        }
+        val appSettings = settings.current()
+        val announcementEnabled = instance.isMinecraft &&
+            appSettings.minecraftLanDiscovery &&
+            session.announcerRunning
+        val probes: List<LanProbeInfo> = if (probe && port != null && session.ready) {
+            withContext(Dispatchers.IO) { endpoints.map { probeEndpoint(it, port) } }
+        } else {
+            emptyList()
+        }
+        // If none of the LAN addresses accept the connection but 127.0.0.1 does,
+        // the server is bound to this phone only (the classic "works on localhost"
+        // report). Say exactly that instead of the generic "not reachable".
+        val bindWarning = if (probes.isNotEmpty() && probes.none { it.ok } && session.ready && port != null) {
+            val loopbackOk = withContext(Dispatchers.IO) {
+                tcpProbe.probe(LOOPBACK_HOST, port, LAN_PROBE_TIMEOUT_MS).ok
+            }
+            if (loopbackOk) {
+                "The server accepts connections on 127.0.0.1 but not on its LAN address, so it " +
+                    "is bound to this phone only. Clear server-ip in server.properties (or the " +
+                    "server's own bind setting) and restart."
+            } else {
+                null
+            }
+        } else {
+            null
+        }
+        warning = appendWarning(warning, bindWarning)
+        warning = appendWarning(warning, dozeWarning())
+        val lan = LanStatus(
+            endpoints = endpoints.map { it.toInfo(instance, port) },
+            port = port,
+            wifiConnected = network?.wifiConnected == true,
+            ethernetConnected = network?.ethernetConnected == true,
+            mobileDataConnected = network?.mobileDataConnected == true,
+            vpnActive = network?.vpnActive == true,
+            announcementEnabled = announcementEnabled,
+            probes = probes,
+            warning = warning,
+            summary = buildLanSummary(instance, endpoints, port, announcementEnabled, session.ready)
+        )
+        session.lanRefreshAt = System.currentTimeMillis()
+        val stillCurrent = synchronized(lock) { this.session } === session
+        if (!stillCurrent) return
+        _runtime.update { status ->
+            if (status.instanceId == session.instanceId && isActiveState(status.state)) {
+                status.copy(lan = lan)
+            } else {
+                status
+            }
+        }
+        if (forceReport || !session.lanReported) {
+            session.lanReported = true
+            emitLanRefreshReport(lan)
+        } else if (probes.isNotEmpty()) {
+            for (info in probes) emitProbeConsole(info)
+        }
+    }
+
+    /** One self-test with a retry: slow phones/GC pauses produce spurious timeouts. */
+    private fun probeEndpoint(endpoint: LanEndpoint, port: Int): LanProbeInfo {
+        var outcome = tcpProbe.probe(endpoint.address, port, LAN_PROBE_TIMEOUT_MS)
+        if (outcome.result == LanProbeResult.TIMEOUT) {
+            outcome = tcpProbe.probe(endpoint.address, port, LAN_PROBE_TIMEOUT_MS)
+        }
+        return LanProbeInfo(
+            address = endpoint.address,
+            port = port,
+            result = outcome.result.name.lowercase(Locale.US),
+            ok = outcome.ok,
+            latencyMs = outcome.latencyMs,
+            detail = outcome.detail
+        )
+    }
+
+    private fun appendWarning(current: String?, extra: String?): String? = when {
+        extra.isNullOrBlank() -> current
+        current.isNullOrBlank() -> extra
+        else -> "$current $extra"
+    }
+
+    /**
+     * Android suspends app network access in Doze even for a foreground service;
+     * LAN clients then time out while the phone is idle. Surface it as a warning
+     * with the fix the app already documents in the power guide.
+     */
+    private fun dozeWarning(): String? {
+        val powerManager = runCatching {
+            appContext.getSystemService(Context.POWER_SERVICE) as? PowerManager
+        }.getOrNull() ?: return null
+        val idle = runCatching { powerManager.isDeviceIdleMode }.getOrDefault(false)
+        val ignoring = runCatching {
+            powerManager.isIgnoringBatteryOptimizations(appContext.packageName)
+        }.getOrDefault(true)
+        return when {
+            idle ->
+                "The phone is in Doze (screen off): Android suspends network access, so LAN " +
+                    "clients may time out until the screen is on. Exempt JavaHost from battery optimization."
+            !ignoring ->
+                "Battery optimization is on; Android may suspend JavaHost's network access while " +
+                    "the screen is off. Exempt it from battery optimization to keep LAN clients connected."
+            else -> null
+        }
+    }
+
+    /**
+     * Applies the live discovery setting and interface changes to the running
+     * server: toggling "Minecraft LAN discovery announcement" takes effect
+     * immediately, and a Wi-Fi/hotspot change re-binds the announcer to the new
+     * interface (a datagram sent on the wrong interface advertises the wrong IP).
+     */
+    private fun reconcileLanAnnouncement(session: Session) {
+        if (!session.isMinecraft || !session.ready) return
+        if (!settings.current().minecraftLanDiscovery) {
+            if (session.announcerRunning) {
+                stopLanAnnouncement(session)
+                emitConsole(
+                    LogLevel.INFO,
+                    "Minecraft LAN discovery announcement turned off. Clients can still use the " +
+                        "LAN address above with Add Server."
+                )
+            }
+            return
+        }
+        if (!session.announcerRunning) {
+            if (System.currentTimeMillis() - session.lastAnnounceAttemptAt < ANNOUNCE_RETRY_MS) return
+            startLanAnnouncement(session)
+            return
+        }
+        val currentInterface = runCatching { lanInfo.preferredNetworkInterface()?.name }.getOrNull()
+        if (currentInterface != null && currentInterface != session.announcedInterface) {
+            stopLanAnnouncement(session)
+            startLanAnnouncement(session)
+        }
+    }
+
+    private fun emitLanRefreshReport(lan: LanStatus) {
+        lan.warning?.let { emitConsole(LogLevel.WARN, "LAN: $it") }
+        lan.summary?.let { emitConsole(LogLevel.INFO, it) }
+        for (info in lan.probes) emitProbeConsole(info)
+    }
+
+    private fun emitProbeConsole(info: LanProbeInfo) {
+        val prefix = "LAN self-test ${info.address}:${info.port}"
+        when {
+            info.ok -> emitConsole(
+                LogLevel.INFO,
+                "$prefix reachable" +
+                    (info.latencyMs?.let { " ($it ms)" } ?: "") +
+                    " - the server accepts connections on this address. (The test runs from the " +
+                    "phone itself; if another device still fails, check router/client isolation " +
+                    "or its firewall.)"
+            )
+            info.result.equals("refused", true) || info.result.equals("timeout", true) -> emitConsole(
+                LogLevel.WARN,
+                "$prefix could not connect (${info.result}). The server may be listening on " +
+                    "127.0.0.1 only, or a firewall / VPN / router isolation is blocking it. " +
+                    "Clear server-ip in server.properties and see the troubleshooting guide."
+            )
+            else -> emitConsole(
+                LogLevel.WARN,
+                "$prefix failed (${info.result}${info.detail?.let { ": $it" } ?: ""})."
+            )
+        }
+    }
+
+    private fun buildNoLanWarning(network: LanNetworkState?): String = when {
+        network == null ->
+            "The app could not read the phone's network interfaces. Open Android settings and " +
+                "check the Wi-Fi connection."
+        network.vpnActive && !network.wifiConnected && !network.ethernetConnected ->
+            "Only a VPN network is active. Connect to the same Wi-Fi/hotspot as the client " +
+                "devices, or turn the VPN off."
+        network.mobileDataConnected && !network.wifiConnected && !network.ethernetConnected ->
+            "The phone is using mobile data only, so other devices cannot reach it over the LAN. " +
+                "Connect the phone to the same Wi-Fi/hotspot as your clients first."
+        else ->
+            "No private IPv4 LAN address was found. Connect the phone to the same Wi-Fi/hotspot " +
+                "as the client devices (or turn on the phone's hotspot and join it from the client)."
+    }
+
+    private fun buildLanSummary(
+        instance: ServerInstance,
+        endpoints: List<LanEndpoint>,
+        port: Int?,
+        announcementEnabled: Boolean,
+        ready: Boolean
+    ): String? {
+        if (endpoints.isEmpty()) return null
+        val first = endpoints.first()
+        if (port == null) {
+            return "Start the server so JavaHost can report which port clients should use."
+        }
+        val target = if (instance.isMinecraft) first.hostPort(port) else first.httpUrl(port)
+        return if (instance.isMinecraft) {
+            val discovery = when {
+                !ready -> "the LAN announcement starts when the server is ready"
+                announcementEnabled -> "LAN auto-discovery is ON"
+                else -> "LAN auto-discovery is OFF (Settings -> Minecraft LAN discovery announcement)"
+            }
+            "Minecraft: add server $target (${first.label}) in the game; $discovery."
+        } else {
+            "From another device on the same Wi-Fi/hotspot open $target (${first.label})."
+        }
+    }
+
+    private fun LanEndpoint.toInfo(instance: ServerInstance, port: Int?): LanEndpointInfo {
+        val shownPort = port?.let { hostPort(it) }
+        val url = if (!instance.isMinecraft && port != null) httpUrl(port) else null
+        return LanEndpointInfo(
+            address = address,
+            interfaceName = interfaceName,
+            label = label,
+            hostPort = shownPort,
+            url = url
+        )
+    }
+
+    /** Minecraft: the advertised port (server.properties wins, then runtime default). */
+    private fun resolveLanPort(instance: ServerInstance, session: Session?): Int? {
+        if (instance.isMinecraft) {
+            val propertyPort = runCatching {
+                ServerPropertiesCodec.port(ServerPropertiesCodec.read(paths.serverProperties(instance.id)))
+            }.getOrNull()
+            return propertyPort ?: session?.serverPort ?: instance.serverPort ?: 25565
+        }
+        return session?.serverPort ?: instance.serverPort
+    }
+
+    /**
+     * Starts the MC multicast announcement for a ready server (idempotent).
+     * Best effort: failure is reported but never blocks the server.
+     */
+    private fun startLanAnnouncement(session: Session) {
+        if (!session.isMinecraft || session.announcerRunning) return
+        if (session.finalized.get() || synchronized(lock) { this.session } !== session) return
+        session.lastAnnounceAttemptAt = System.currentTimeMillis()
+        if (!settings.current().minecraftLanDiscovery) {
+            emitConsole(
+                LogLevel.INFO,
+                "Minecraft LAN discovery announcement is OFF. Clients can still use the LAN " +
+                    "address above with Add Server, or enable it in Settings."
+            )
+            return
+        }
+        val instance = instances.get(session.instanceId) ?: return
+        val port = resolveLanPort(instance, session) ?: return
+        val motdProperty = runCatching {
+            ServerPropertiesCodec.read(paths.serverProperties(instance.id))[ServerPropertiesCodec.MOTD]
+        }.getOrNull()
+        val motd = MinecraftLanAnnouncement.sanitizeMotd(motdProperty, instance.name)
+        val announcer = lanAnnouncer ?: MinecraftLanAnnouncer(lanInfo).also { lanAnnouncer = it }
+        session.announcedInterface =
+            runCatching { lanInfo.preferredNetworkInterface()?.name }.getOrNull()
+        val started = runCatching {
+            announcer.start(MinecraftLanAnnouncer.Announcement(motd, port))
+        }.getOrDefault(false)
+        // Re-check after the slow disk/interface work above: a stop/finish that
+        // landed in that window already called stopLanAnnouncement(), so this
+        // late start would otherwise become a ghost announcement for a dead run.
+        if (started && (session.finalized.get() || synchronized(lock) { this.session } !== session)) {
+            stopLanAnnouncement(session)
+            return
+        }
+        session.announcerRunning = started
+        if (started) {
+            emitConsole(
+                LogLevel.INFO,
+                "Minecraft LAN discovery: announcing \"$motd\" on UDP 224.0.2.60:4445 " +
+                    "(port $port). The server should appear under \"Scanning for games on your " +
+                    "local network\" in Minecraft."
+            )
+        } else {
+            emitConsole(
+                LogLevel.WARN,
+                "Could not start the Minecraft LAN discovery announcement. Clients can still " +
+                    "connect by adding the LAN address above manually."
+            )
+        }
+    }
+
+    private fun stopLanAnnouncement(session: Session) {
+        session.announcerRunning = false
+        runCatching { lanAnnouncer?.stop() }
+    }
+
+    /**
+     * A stale `server-ip=127.0.0.1` (or an address of the phone only) is the
+     * classic "works on localhost, unreachable on the LAN" trap. Clear loopback
+     * binds before the JVM starts and tell the user.
+     */
+    private fun normalizeMinecraftBindAddress(instance: ServerInstance) {
+        if (!instance.isMinecraft) return
+        val file = paths.serverProperties(instance.id)
+        if (!file.isFile) return
+        val raw = runCatching { ServerPropertiesCodec.readRaw(file) }.getOrNull() ?: return
+        val entries = runCatching { ServerPropertiesCodec.parse(raw) }.getOrNull() ?: return
+        val current = ServerPropertiesCodec.serverIp(entries)
+        val normalized = ServerPropertiesCodec.normalizeBindAddress(current)
+        if (normalized == (current ?: "")) return
+        val updated = entries.toMutableMap()
+        runCatching { ServerPropertiesCodec.setServerIp(updated, normalized) }
+        runCatching { ServerPropertiesCodec.writeText(file, updated, raw) }
+            .onSuccess {
+                emitConsole(
+                    LogLevel.WARN,
+                    "server-ip was \"${current ?: ""}\", which only accepts connections on this " +
+                        "phone. Cleared it before launch so other devices can connect (server.properties)."
+                )
+            }
+            .onFailure {
+                emitConsole(
+                    LogLevel.WARN,
+                    "server-ip is set to a phone-only address ($current), so other devices cannot " +
+                        "connect. Remove it from server.properties and restart."
+                )
+            }
     }
 
     private suspend fun stopSession(session: Session, force: Boolean) {
@@ -1053,6 +1471,7 @@ class ServerManager(
         session.stopping = true
         session.stopRequested = true
         if (force) session.forceRequested = true
+        stopLanAnnouncement(session)
 
         val alive = isProcessAlive(session.process)
         if (alive) {
@@ -1139,6 +1558,7 @@ class ServerManager(
 
     private fun finishSession(session: Session, exitCode: Int) {
         if (!session.finalized.compareAndSet(false, true)) return
+        stopLanAnnouncement(session)
         session.statsJob?.cancel()
         val now = System.currentTimeMillis()
         val duration = (now - session.startedAt).coerceAtLeast(0L)
@@ -1355,6 +1775,11 @@ class ServerManager(
         @Volatile var readerJob: Job? = null
         @Volatile var waitJob: Job? = null
         @Volatile var statsJob: Job? = null
+        @Volatile var lanReported = false
+        @Volatile var lanRefreshAt = 0L
+        @Volatile var announcerRunning = false
+        @Volatile var announcedInterface: String? = null
+        @Volatile var lastAnnounceAttemptAt = 0L
 
         fun pushTail(line: String) {
             synchronized(tailLock) {
@@ -1379,6 +1804,11 @@ class ServerManager(
         const val MAX_CONSOLE_LIMIT = 20_000
         const val CONSOLE_PUBLISH_INTERVAL_MS = 100L
         const val MAX_CONSOLE_LINE_CHARS = 8_000
+        const val LAN_REFRESH_INTERVAL_MS = 10_000L
+        const val LAN_READY_SETTLE_MS = 750L
+        const val LAN_PROBE_TIMEOUT_MS = 2_500
+        const val ANNOUNCE_RETRY_MS = 30_000L
+        const val LOOPBACK_HOST = "127.0.0.1"
         const val GRACEFUL_STOP_MAX_MS = 20_000L
         const val GENERIC_STOP_GRACE_MS = 2_000L
         const val KILL_GRACE_MS = 3_000L

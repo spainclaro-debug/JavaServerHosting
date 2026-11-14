@@ -1,5 +1,13 @@
 # Troubleshooting
 
+## Upgrading from 1.1.6
+
+The JavaHost 1.2.0 APK is signed with the same development key as 1.1.6 and
+installs as an **in-place upgrade**: server instances, `server.properties`, the
+installed JRE and settings (including the new LAN discovery toggle) are kept. If
+you installed a build signed with a different key, Android will refuse the
+update; back up the instance working directories before uninstalling.
+
 ## “Stopping the server never finishes / notification keeps saying Shutting down”
 
 Fixed in **1.1.2/1.1.3**, but here is how the stop path works and what to do if it
@@ -65,22 +73,91 @@ For non-Minecraft JARs the console, notification and server screen show:
 
 - the server **port** parsed from its log (or the optional port you set), and
 - the number of **established TCP connections** on that port, read from
-  `/proc/net/tcp`/`tcp6`. If the ROM hides `/proc`, it shows `n/a`; this is not
-  an error.
+  `/proc/net/tcp`/`tcp6`. Android 10+ SELinux blocks apps from reading those files
+  (`neverallow` for `proc_net_tcp_udp`), so a modern phone normally shows `n/a`;
+  this is expected, not an error.
 
 ## “The server is running but does not appear in Minecraft”
 
-Android Wi-Fi often blocks the multicast that Minecraft uses for LAN discovery,
-so a healthy server may not show up automatically. 1.1.5 prints a line like:
+Minecraft **dedicated servers never announce themselves** on the LAN — only a
+world opened with “Open to LAN” broadcasts. 1.2.0 emulates that announcement
+for the running Minecraft server: while a server is running and **Settings →
+Minecraft LAN discovery announcement** is on (default), JavaHost sends
+`[MOTD]…[/MOTD][AD]<port>[/AD]` to UDP multicast `224.0.2.60:4445` every ~1.5 s
+(holding a `MulticastLock`), so a client on the same Wi-Fi/hotspot should list it
+under “Scanning for LAN games”.
 
-```
-LAN address: 192.168.1.50:25565 — if Minecraft does not list the server
-automatically, use "Add Server" with this address.
-```
+Discovery is **best-effort**, not a guarantee:
 
-Add it manually in Minecraft (same Wi-Fi/hotspot, TCP port 25565; Bedrock uses
-UDP 19132 through Geyser). If no LAN address is printed, the phone is not on a
-LAN; connect it to Wi-Fi/hotspot first.
+1. **Check the server screen's LAN card.** It lists the exact `address:port` for
+   every usable LAN interface, each with a copy button. Add it with the client's
+   **Add Server** dialog instead of guessing. This is the authoritative address.
+2. **Confirm the announcement toggle is on** for Minecraft instances. If it is
+   off, only manual entry works. The toggle can be changed while the server runs.
+   For generic Java servers there is no announcement — always use the LAN card.
+3. **Same Wi-Fi/hotspot.** The client must be on the same network as the phone.
+   Client isolation, a guest network or a different subnet also stops the
+   multicast from arriving — see the checklist below.
+4. **Turn off VPNs** on the phone and on the client; a VPN can swallow multicast
+   or route LAN traffic out of the network.
+5. **Some clients/versions do not scan the LAN list** (modded clients especially,
+   and Bedrock is a different protocol). If **Add Server** with the LAN card
+   address works and the LAN list stays empty, the server is fine and only
+   discovery is blocked — use the manual address, or share the address instead.
+6. **Android 16/17 local-network permission.** Android 17 adds a local-network
+   runtime consent and Android 16 an opt-in equivalent; if the OS prompts for or
+   gates local-network access, allow it for JavaHost (see below).
+
+If no address is shown on the LAN card at all, the phone is not on a LAN (for
+example mobile-data-only). Connect it to Wi-Fi/hotspot first.
+
+## “Other devices on the same network cannot connect”
+
+Work through this order; each step is cheap and the app now surfaces most of
+them. The server itself may be perfectly healthy while the network blocks it.
+
+1. **Use the exact address from the server's LAN card.** The card shows the
+   interface label (`Wi-Fi`, `Ethernet`, `Hotspot`) and `address:port`; use the
+   copy button. If several addresses are listed, try each — only one may be the
+   network the client is on.
+2. **Clear the bind address (`server-ip`).** A loopback value such as
+   `127.0.0.1` makes the server reachable only from the phone. 1.2.0 clears a
+   loopback bind before start and the **Properties → Bind address (server-ip)**
+   field warns about it; leave it blank (all interfaces) unless you know why not.
+3. **Same Wi-Fi/hotspot and same subnet.** The phone and the client must be on
+   the same network (SSID) and subnet (e.g. both `192.168.1.x`). A different
+   subnet, a repeater with its own NAT or a `10.x` cellular address is not the
+   same LAN.
+4. **Turn VPNs off** (phone and client). A VPN can block inbound connections and
+   route multicast away from the LAN.
+5. **The phone must not be mobile-data-only.** If the LAN card shows no usable
+   address or warns that only mobile data is connected, join Wi-Fi/hotspot first.
+6. **Router AP/client isolation and guest networks.** “AP isolation”, “client
+   isolation” or a guest Wi-Fi that separates clients will block LAN traffic
+   regardless of the app. Disable isolation or use the phone's hotspot.
+7. **Hotspot client isolation.** Some phones/ROMs isolate clients connected to
+   their own hotspot. If the server works from the phone but not from devices on
+   its hotspot, try a different hotspot/ROM setting or a router.
+8. **Android 16/17 local-network permission.** Android 17 requires a
+   local-network runtime permission (Android 16 has an opt-in equivalent).
+   JavaHost declares `ACCESS_LOCAL_NETWORK`; check the system app info for a
+   Local network permission and allow it if the OS offers one.
+9. **Test from the app.** On the server screen tap **Test LAN reachability**.
+   The self-test opens a TCP connection from the phone to its own LAN
+   IP:port:
+   - `REACHABLE` — the phone side is fine; the blocker is between the router and
+     the client (isolation, client firewall, different VLAN/subnet).
+   - `REFUSED` — nothing is listening on that interface: check the bind address,
+     the port and whether the server is really up.
+   - `TIMEOUT` — a firewall or network layer is dropping the connection.
+10. **Client-side checks:** the client's firewall/antivirus/Wi-Fi privacy mode,
+    a “private DNS/private Wi-Fi” setting, or a corporate/education network can
+    all block TCP 25565. Bedrock clients use UDP 19132 via Geyser/Floodgate, not
+    the Java port.
+
+If the app's self-test is `REACHABLE` and the address is correct but another
+device still cannot connect, the block is in the router/network, not in
+JavaHost; see the router isolation steps above.
 
 ## “A JAR import fails with duplicate entry (LICENSE) / not a valid archive”
 

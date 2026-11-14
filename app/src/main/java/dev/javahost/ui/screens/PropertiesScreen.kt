@@ -44,6 +44,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import dev.javahost.core.model.RunState
 import dev.javahost.core.model.ServerInstance
+import dev.javahost.core.storage.ServerPropertiesCodec
 import dev.javahost.ui.AppActions
 import dev.javahost.ui.AppUiState
 import dev.javahost.ui.components.EmptyState
@@ -57,6 +58,7 @@ import dev.javahost.ui.components.SuccessRow
 import dev.javahost.ui.components.readableMessage
 import dev.javahost.ui.theme.InfoBlue
 import dev.javahost.ui.theme.TealGreen
+import dev.javahost.ui.theme.WarnAmber
 import kotlinx.coroutines.launch
 
 private const val EULA_URL = "https://aka.ms/MinecraftEULA"
@@ -337,6 +339,22 @@ fun PropertiesScreen(
                         supportingText = "Default ${PROPERTY_DEFAULTS["server-port"]} · 1–65535"
                     )
                     LabeledField(
+                        label = "Bind address (server-ip)",
+                        value = draft["server-ip"] ?: "",
+                        onValueChange = { draft["server-ip"] = it },
+                        supportingText = "Leave empty to accept connections from other devices. " +
+                            "127.0.0.1 = this phone only."
+                    )
+                    if (ServerPropertiesCodec.isLoopbackBind(draft["server-ip"])) {
+                        Text(
+                            "This address only accepts connections from this phone: other devices on " +
+                                "your network will not be able to connect. Leave the field empty so the " +
+                                "server listens on all interfaces.",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = WarnAmber
+                        )
+                    }
+                    LabeledField(
                         label = "MOTD",
                         value = draft["motd"] ?: "",
                         onValueChange = { draft["motd"] = it },
@@ -579,5 +597,13 @@ private fun validateProperties(entries: Map<String, String>): String? {
     if (gamemode.isNotEmpty() && gamemode !in GAMEMODES) {
         return "\"gamemode\" must be one of ${GAMEMODES.joinToString(", ")}."
     }
+    val serverIp = entries["server-ip"]?.trim().orEmpty()
+    if (serverIp.isNotEmpty() && !SERVER_IP_PATTERN.matches(serverIp)) {
+        return "\"server-ip\" may only contain letters, digits, dots, colons, hyphens and " +
+            "underscores, or be left empty to listen on all interfaces."
+    }
     return null
 }
+
+/** A bind address is a host name or literal IP; Java rejects whitespace and `=`. */
+private val SERVER_IP_PATTERN = Regex("^[A-Za-z0-9._:-]+$")

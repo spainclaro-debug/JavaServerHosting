@@ -111,6 +111,17 @@ interface AppActions {
     fun exportConsole(uri: Uri)
     suspend fun readStartupTail(instanceId: String, lines: Int = 200): List<String>
 
+    // --- LAN -------------------------------------------------------------------
+    /**
+     * Re-resolve the LAN addresses of the running server and TCP-probe each one,
+     * publishing the result to [ServerRuntimeStatus.lan]. No-op (with a message)
+     * when no server is active.
+     */
+    fun probeLan()
+
+    /** Enable/disable the Minecraft LAN discovery announcement for running servers. */
+    fun setMinecraftLanDiscovery(enabled: Boolean)
+
     // --- settings --------------------------------------------------------------
     fun setDefaultMemory(mb: Int)
     fun setAutoMemoryDefault(enabled: Boolean)

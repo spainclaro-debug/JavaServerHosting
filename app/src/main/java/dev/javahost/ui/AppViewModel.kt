@@ -603,6 +603,14 @@ class AppViewModel(application: Application) : AndroidViewModel(application), Ap
         container.server.sendCommand(command)
     }
 
+    override fun probeLan() {
+        if (!container.server.probeLan()) {
+            showMessage("Start the server to test its LAN address.")
+            return
+        }
+        showMessage("Testing LAN reachability from the phone…")
+    }
+
     /** Called from MainActivity.onResume so status reflects system-dialog changes. */
     fun onResume() {
         refreshPowerChecks()
@@ -661,6 +669,8 @@ class AppViewModel(application: Application) : AndroidViewModel(application), Ap
 
     override fun setTermuxMirror(mirror: String) = updateSettings { it.copy(termuxMirror = mirror.trim()) }
     override fun setAutoRestart(enabled: Boolean) = updateSettings { it.copy(autoRestartOnCrash = enabled) }
+    override fun setMinecraftLanDiscovery(enabled: Boolean) =
+        updateSettings { it.copy(minecraftLanDiscovery = enabled) }
 
     override fun setInstanceJvmArgs(id: String, args: String) {
         container.instances.update(id) { it.copy(jvmArgs = args.trim()) }

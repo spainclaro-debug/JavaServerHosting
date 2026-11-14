@@ -1,5 +1,74 @@
 # Changelog
 
+## 1.2.0 — 2026-11-15
+
+Fixes the “server is running but LAN clients cannot connect / Minecraft never
+lists the server” report.
+
+### Root causes
+- **The LAN address was a naive pick.** `ServerManager.emitLanAddress()` printed
+  the first site-local IPv4 of any non-loopback interface. On real phones that is
+  frequently the **cellular** interface (`ccmni*`, `rmnet*`) or a **VPN**
+  (`tun*`), so the printed address was unreachable while `localhost` still worked.
+- **Nothing verified the bind.** No test confirmed the server was listening on the
+  LAN address; a leftover `server-ip=127.0.0.1` (or a server bound to loopback)
+  made localhost work and every LAN client fail silently.
+- **Dedicated servers never announce themselves.** Only worlds opened with
+  Minecraft's “Open to LAN” broadcast via UDP multicast
+  `224.0.2.60:4445` (`[MOTD]<motd>[/MOTD][AD]<port>[/AD]`). JavaHost did not
+  announce, so the game's LAN list stayed empty.
+- **No LAN UI or diagnostics.** No screen showed the actual LAN address, a
+  reachability self-test, or the real blockers (VPN, mobile-data-only, AP
+  isolation, loopback bind).
+
+### Fixes
+- **Correct LAN address resolution:** Wi-Fi, ethernet and hotspot interfaces are
+  accepted; cellular, VPN and virtual interfaces and non-private IPv4 addresses
+  are rejected. Every usable address is listed (multi-address card), deduplicated
+  and labelled (`Wi-Fi`, `Ethernet`, `Hotspot`, `Network`).
+- **TCP reachability self-test** from the phone to its own LAN IP:port
+  (“Test LAN reachability”), with actionable `REFUSED` / `TIMEOUT` messages that
+  point at the real cause instead of a silent failure.
+- **Minecraft LAN discovery announcement:** the running Minecraft server is
+  broadcast to the game's LAN list via UDP multicast
+  `224.0.2.60:4445` every ~1.5 s on the Wi-Fi/hotspot interface, with a
+  `MulticastLock` acquired when available (sending does not require it).
+  MOTDs are sanitised; announcement errors are reported at most once per 30 s.
+- **`server-ip` loopback normalization:** a loopback bind (`127.0.0.1`, `::1`,
+  `localhost`) is cleared before start, and the server properties editor gains a
+  typed **Bind address (server-ip)** field with validation and a warning for
+  loopback values.
+- **LAN card on the server screen** with every usable address, a copy button per
+  address, the “Test LAN reachability” probe rows, a connectivity warning and
+  the **Announce on the LAN (auto-discovery)** switch; **Settings** gains a
+  **Minecraft LAN discovery announcement** toggle (on by default, live).
+- New permissions: `CHANGE_WIFI_MULTICAST_STATE` (multicast announcements) and
+  `ACCESS_LOCAL_NETWORK` (Android 17 local-network permission; forward
+  compatibility, never requested at runtime on older releases).
+- **Live controls and better diagnosis:** the “Announce on the LAN” switch applies to a
+  running server immediately, the announcer re-binds when Wi-Fi/hotspot changes, the
+  self-test reports “bound to this phone only” when `127.0.0.1` answers but the LAN address
+  does not, and Doze/battery-optimization network suspension is surfaced as a warning.
+- 327 hermetic unit tests (0 failures, 3 environment-gated skips; new LAN address
+  selection, Minecraft announcement and TCP probe suites plus `server-ip` codec cases).
+- **Release note:** the 1.2.0 APK is signed with the same development key as
+  1.1.6, so it installs as an **in-place upgrade**; instances, settings and
+  worlds are preserved.
+
+### Known limitations
+- **Dedicated-server discovery is best-effort.** The client must be on the same
+  Wi-Fi/hotspot, and some clients/versions do not scan the LAN list at all; use
+  the address from the server's LAN card with **Add Server** when that happens.
+- **Android 16 opt-in / Android 17 local-network permission.** Android 17
+  introduces a local-network runtime permission and Android 16 an opt-in
+  equivalent; JavaHost declares `ACCESS_LOCAL_NETWORK` but the platform consent
+  flow is still rolling out, so behaviour can differ by OS version.
+- **AP/client isolation and guest networks block LAN regardless of the app.**
+  Router isolation, hotspot client isolation and guest Wi-Fi separate clients
+  from the phone; no app-side fix exists.
+- **Bedrock clients still need Geyser/Floodgate** (UDP 19132) — the Java LAN
+  announcement does not make a Java server visible to Bedrock.
+
 ## 1.1.6 — 2026-11-15
 
 - **Silent-media keep-alive is now a normal in-app toggle**: the build feature

@@ -12,9 +12,10 @@ Run:
 ./gradlew :app:testDebugUnitTest
 ```
 
-Final run in this environment: **253 tests, 0 failures, 0 errors, 3 skipped**
-(the skipped tests are environment-gated real-archive/real-JRE smoke tests that
-only run when their fixture variables are provided).
+Final run in this environment for the 1.2.0 suite: **327 hermetic tests,
+0 failures, 0 errors, 3 skipped** (253 before this release; the skipped tests are environment-gated
+real-archive/real-JRE smoke tests that only run when their fixture variables are
+provided).
 
 Coverage by area:
 
@@ -25,7 +26,8 @@ Coverage by area:
 | Console | ANSI stripping, level parsing, player counts, join/leave, ready/port detection, crash signatures |
 | Crash classification | OOM, port in use, unsupported class version, missing library, EULA, signal 137, unknown |
 | JRE pipeline | Termux `Packages` parsing, dependency resolution, `ar`/`.deb` extraction with synthetic archives, traversal rejection, cacerts overlay, archive import (tar.xz/gz/zip), folder-layout/java-home discovery, bionic-vs-glibc ELF validation, arm64 `OS_ARCH` checks, permissions, release file |
-| Storage | `server.properties` parse/format (comments/order/unknown keys), port validation, file-browser path/symlink containment |
+| Storage | `ServerPropertiesCodecTest` — `server.properties` parse/format (comments/order/unknown keys), port validation, `server-ip` get/set/loopback-normalisation cases; `FileBrowserSafetyTest` — path/symlink containment |
+| LAN (new in 1.2.0) | `core/net/LanAddressTest` — private-IPv4/loopback checks, cellular/VPN interface rejection, kind classification/labels, dedupe and `WIFI < ETHERNET < HOTSPOT < OTHER` ordering, empty/all-filtered input; `core/net/MinecraftLanAnnouncementTest` — message/payload format, MOTD sanitisation, port validation; `core/net/LanProbeTest` — `REACHABLE`/`REFUSED`/`TIMEOUT`/`ERROR` mapping, latency, host/port validation, no exception on bad input; plus the `server-ip` cases in `ServerPropertiesCodecTest` |
 | System | safe/auto heap math, battery/notification state helpers |
 | Misc | log rotation/tail, heap-sampler parsing, generic TCP connection counter, EULA text |
 
@@ -52,7 +54,41 @@ Android app sandbox, foreground service or Doze.
 | Modrinth API live smoke | ✅ search `worldedit` plugins for 1.20.4/paper returned hits; project versions returned a primary `.jar` (16 KB, SHA-1 present); file HEAD → HTTP 200. UA/facets/encoding validated manually; not part of the hermetic suite |
 | Termux mirror smoke (live) | ✅ `Packages.gz` 732 KB → parsed 3,029 packages; real `openjdk-21` deb chain downloaded with SHA-256 verification and extracted to a runnable JRE |
 | Mirror speed probe (host/dev network) | ✅ TUNA ~2.9 MB/s, MWT ~2.5 MB/s, Grimler ~1.4 MB/s, USTC ~0.7 MB/s, BFSU ~0.4 MB/s on a 3 MB range request; auto-probe ordering is unit-tested without network |
-| Full Gradle unit suite | ✅ 253 tests, 0 failures, 0 errors, 3 skipped |
+| Full Gradle unit suite | ✅ 327 tests, 0 failures, 0 errors, 3 skipped |
+
+### LAN smoke check (JVM)
+
+The hermetic LAN tests use fakes; this host-level check exercises the real socket
+paths once per release (no Android device needed — a plain JVM on the same host
+is enough). It is **not** part of `testDebugUnitTest` and does not download
+anything.
+
+1. **Start a real server.** Launch the sample target the same way the app does,
+   e.g. `java -jar tools/sample-generic-server/generic-server.jar --port 18081`,
+   and wait for it to listen.
+2. **Probe loopback and the LAN IP.** With `SocketTcpProbe` (or the app's
+   **Test LAN reachability** action when running on-device):
+   - `probe("127.0.0.1", 18081)` → `REACHABLE` with a measured latency;
+   - `probe(<host LAN IPv4>, 18081)` → `REACHABLE` when the server binds all
+     interfaces (this is the address the LAN card shows);
+   - `probe(<host LAN IPv4>, <closed port>)` → `REFUSED`;
+   - `probe(<blackholed address>, <port>)` → `TIMEOUT` where the network drops
+     packets (`No route to host`/`REFUSED` is also a valid platform outcome and
+     is mapped by the probe accordingly).
+   A loopback-only bind must fail the LAN-IP probe while loopback succeeds —
+   that is the regression the self-test exists to catch.
+3. **Verify the announcement datagram.** Bind a `MulticastSocket`/`DatagramSocket`
+   to UDP `4445` and join `224.0.2.60` (or capture the loop with a listener),
+   start the announcer with a test MOTD and the server port, and assert one
+   received datagram equals
+   `MinecraftLanAnnouncement.payload("<motd>", <port>)` — i.e. the UTF-8 bytes of
+   `[MOTD]<motd>[/MOTD][AD]<port>[/AD]` — and that sends arrive about every
+   1.5 s. Use a sanitised MOTD from `sanitizeMotd` when checking the exact text.
+4. **On-device follow-up:** run the LAN card + Minecraft client check in the
+   manual checklist below; real multicast delivery depends on the access point.
+
+Results for a release are recorded with that release's artifacts (see the
+v1.2.0 release).
 
 Known host-level quirks observed:
 
@@ -90,6 +126,22 @@ Not executed in this build environment (no device or emulator attached).
    server args `--port 18081`, start, verify the console and port; also import a
    non-Minecraft server such as WireMock.
 6. **Generic stats** — start the sample generic server, connect a TCP client, and confirm the console/notification show the port and a connection count (not players).
+6b. **LAN card** — on a phone connected to Wi-Fi, start a server and confirm the
+   server screen lists the correct `Wi-Fi` `address:port` (the same address the
+   router shows), plus a second address when the phone is also on ethernet/
+   hotspot; confirm the copy button. Disconnect Wi-Fi and use mobile data only:
+   no cellular `10.x` address may be listed, and the card must warn.
+6c. **LAN self-test** — tap **Test LAN reachability**: the phone's own LAN address
+   must be `REACHABLE`. Set `server-ip` to `127.0.0.1` in the properties editor,
+   restart, and confirm the app normalises it away before start (server still
+   reachable from the LAN) and that the field warns about loopback.
+6d. **Minecraft LAN discovery** — with the announcement toggle on (default),
+   open a Minecraft client on another device on the same Wi-Fi: the server must
+   appear under “Scanning for LAN games” within a few seconds. Turn the toggle
+   off while the server runs and confirm it disappears/does not reappear; use
+   **Add Server** with the LAN card address to confirm manual play. Repeat on a
+   guest network or with AP isolation enabled and confirm the docs' warning that
+   no app-side fix exists.
 7. **Screen off** — start a server, turn the screen off for 15+ minutes, confirm
    the process stays alive and the console keeps flowing.
 7. **Doze** — leave the device idle/unplugged for 30+ minutes with the
@@ -116,3 +168,6 @@ Not executed in this build environment (no device or emulator attached).
 - Unit tests do not download anything. The JRE installer's full network path is
   covered by parser/extractor tests plus the host-level real-deb assembly above;
   its `Context`-dependent wrapper is compile-tested only.
+- LAN multicast delivery, AP/client isolation and the Android 16/17 local-network
+  consent can only be verified with a real phone plus an access point and a
+  second client; the manual checklist items 6b–6d cover them.

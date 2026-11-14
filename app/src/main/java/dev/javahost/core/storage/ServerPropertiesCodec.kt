@@ -24,6 +24,7 @@ object ServerPropertiesCodec {
     /* ------------------------------------------------------------------ */
 
     const val SERVER_PORT = "server-port"
+    const val SERVER_IP = "server-ip"
     const val MOTD = "motd"
     const val MAX_PLAYERS = "max-players"
     const val ONLINE_MODE = "online-mode"
@@ -48,7 +49,8 @@ object ServerPropertiesCodec {
         LEVEL_NAME,
         PVP,
         WHITE_LIST,
-        ENABLE_COMMAND_BLOCK
+        ENABLE_COMMAND_BLOCK,
+        SERVER_IP
     )
 
     val DIFFICULTIES: Set<String> = setOf("peaceful", "easy", "normal", "hard")
@@ -146,6 +148,61 @@ object ServerPropertiesCodec {
     fun setPort(entries: MutableMap<String, String>, port: Int) {
         requireKey(SERVER_PORT)
         entries[SERVER_PORT] = validatePort(port).toString()
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* server-ip (bind address) helpers                                   */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * The configured `server-ip` bind address, trimmed, or null when the key is
+     * absent. An empty string means "bind on all interfaces" (Minecraft's
+     * default and the value that makes LAN access work).
+     */
+    fun serverIp(entries: Map<String, String>): String? = entries[SERVER_IP]?.trim()
+
+    /**
+     * Sets `server-ip`. Blank (or whitespace-only) values are allowed and mean
+     * "all interfaces"; anything else must be a plain IP address or hostname
+     * (`[A-Za-z0-9._:-]+`, which accepts IPv4, IPv6 and simple host names but
+     * not whitespace, `=` or line breaks).
+     *
+     * @throws IllegalArgumentException when [value] contains unsupported characters.
+     */
+    fun setServerIp(entries: MutableMap<String, String>, value: String) {
+        val trimmed = value.trim()
+        require(trimmed.isEmpty() || BIND_ADDRESS_PATTERN.matches(trimmed)) {
+            "Invalid server-ip \"$value\": use an IP address or host name containing only " +
+                "letters, digits, '.', '-', '_' and ':' (blank = all interfaces)"
+        }
+        entries[SERVER_IP] = trimmed
+    }
+
+    /**
+     * True when binding to [value] would make the server reachable only from
+     * this phone: any `127.0.0.0/8` address, the IPv6 loopback `::1`, or the
+     * `localhost` host name (case-insensitive). False for null or blank.
+     */
+    fun isLoopbackBind(value: String?): Boolean {
+        val trimmed = value?.trim() ?: return false
+        if (trimmed.isEmpty()) return false
+        if (trimmed.equals("localhost", ignoreCase = true)) return true
+        if (trimmed == "::1") return true
+        if (!trimmed.startsWith("127.")) return false
+        val octets = trimmed.split('.')
+        return octets.size == 4 && octets.all { octet ->
+            octet.toIntOrNull()?.let { it in 0..255 } == true
+        }
+    }
+
+    /**
+     * The safe value to write (or to pass to the server JVM) for a bind address:
+     * `""` for null, blank or loopback values — so a stale `server-ip=127.0.0.1`
+     * is normalized back to "all interfaces" — and otherwise the trimmed value.
+     */
+    fun normalizeBindAddress(value: String?): String {
+        val trimmed = value?.trim().orEmpty()
+        return if (trimmed.isEmpty() || isLoopbackBind(trimmed)) "" else trimmed
     }
 
     fun putInt(entries: MutableMap<String, String>, key: String, value: Int) {
@@ -265,6 +322,9 @@ object ServerPropertiesCodec {
     /* ------------------------------------------------------------------ */
 
     private data class EntryLine(val key: String, val value: String)
+
+    /** Characters Minecraft/Java accept for `server-ip`; also blocks CR/LF injection. */
+    private val BIND_ADDRESS_PATTERN = Regex("^[A-Za-z0-9._:-]+$")
 
     private fun splitLines(raw: String): Pair<List<String>, Boolean> {
         val text = raw.removePrefix("\uFEFF")

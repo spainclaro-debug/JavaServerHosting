@@ -9,14 +9,16 @@ Built with Kotlin + Jetpack Compose. Target: **arm64-v8a, Android 8.0+ (API 26),
 no root**. The APK is intended for GitHub/F-Droid-style sideloading; see
 [Why targetSdk 28](docs/ARCHITECTURE.md#why-the-app-targets-api-28).
 
-> **Status:** functional MVP, buildable and tested. **253 hermetic unit tests pass
-> (0 failures, 3 environment-gated skips)**; debug and signed release APKs are
-> built. Minecraft (Vanilla 1.20.4, Paper 1.20.4, Fabric 1.20.4), a generic Java
-> server (WireMock) and a purpose-built sample HTTP server were booted on an
-> Android/bionic OpenJDK 21 during development. On-device
-> foreground-service/Doze behaviour is covered by design and a manual checklist
-> but was **not** executed in this build environment (no device/emulator). See
-> [docs/TESTING.md](docs/TESTING.md).
+> **Status:** functional MVP, buildable and tested. **327 hermetic unit tests
+> (0 failures, 3 environment-gated skips)**; debug and signed release APKs
+> are built. The current release is **1.2.0** (versionCode 9, LAN hosting &
+> discovery); see [CHANGELOG.md](CHANGELOG.md). Minecraft (Vanilla 1.20.4, Paper
+> 1.20.4, Fabric 1.20.4), a generic Java server (WireMock) and a purpose-built
+> sample HTTP server were booted on an Android/bionic OpenJDK 21 during
+> development.
+> On-device foreground-service/Doze behaviour is covered by design and a manual
+> checklist but was **not** executed in this build environment (no
+> device/emulator). See [docs/TESTING.md](docs/TESTING.md).
 >
 > Prebuilt, installable APKs are attached to
 > [GitHub Releases](https://github.com/spainclaro-debug/JavaServerHosting/releases).
@@ -79,6 +81,31 @@ no root**. The APK is intended for GitHub/F-Droid-style sideloading; see
 - Player count parsed from server output and shown in the notification/UI.
 - Server readiness detection and crash diagnostics.
 
+### LAN hosting & discovery (1.2.0)
+- **Correct LAN address resolution:** only Wi-Fi, ethernet and hotspot
+  interfaces are used, and only private IPv4 addresses; cellular, VPN and
+  virtual interfaces are ignored. Every usable address is listed with a label
+  (`Wi-Fi`, `Ethernet`, `Hotspot`) and a copy button, so the phone's data
+  connection can never be mistaken for its LAN address.
+- **LAN card on the server screen** with the exact `address:port` to type into a
+  client's **Add Server** dialog, and **Test LAN reachability** — the app opens a
+  TCP connection to its own LAN IP:port and explains `REFUSED`/`TIMEOUT` instead
+  of failing silently.
+- **Minecraft auto-discovery:** the running Minecraft server is announced on
+  UDP multicast `224.0.2.60:4445` (`[MOTD]…[/MOTD][AD]<port>[/AD]`) every
+  ~1.5 s with a `MulticastLock`, so clients on the same Wi-Fi/hotspot list it
+  under “scanning for LAN games”. The server's LAN card and **Settings** both
+  have a **Minecraft LAN discovery announcement** toggle (on by default); off
+  keeps the manual address.
+- **`server-ip` handling:** a loopback bind (`127.0.0.1`, `::1`, `localhost`) in
+  `server.properties` is cleared before start, and the properties editor has a
+  typed **Bind address (server-ip)** field that warns when a value would make
+  the server reachable only from the phone.
+- Caveats that no app can fix: clients must be on the **same Wi-Fi/hotspot**, and
+  router AP/client isolation or guest networks block LAN traffic. Dedicated-server
+  discovery is best-effort (some clients/versions do not scan); Bedrock clients
+  still need Geyser/Floodgate. See [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md).
+
 ### Generic Java path (power user)
 - No Minecraft UI; working-directory file manager, raw JVM args and server args.
   Console/notification show the server port and established TCP connections
@@ -126,7 +153,7 @@ exemption → Phantom Process Killer guidance → optional Minecraft EULA → do
 
 ```bash
 # JDK 17+ and Android SDK 34 required.
-./gradlew :app:testDebugUnitTest   # 253 hermetic tests
+./gradlew :app:testDebugUnitTest   # 327 hermetic tests
 ./gradlew :app:assembleDebug       # app/build/outputs/apk/debug/app-debug.apk
 ./gradlew :app:assembleRelease     # unsigned; sign with apksigner for distribution
 ```
@@ -201,11 +228,15 @@ versions even though the server runs.
 
 - Stop/restart stuck at “Shutting down…”
 - Plugins (Geyser/Floodgate/ViaVersion) installed but not loading
+- Server does not appear in Minecraft / other devices cannot connect
 - Server visible in Minecraft but join fails
 
 See [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md) for the server-flavor /
-loader matrix and the join checklist. JavaHost 1.1.2 also hardens the stop path
-and prints a per-start diagnostic with the server type and plugin/mod counts.
+loader matrix, the LAN card and join checklists. JavaHost 1.2.0 adds correct LAN
+address resolution, a TCP reachability self-test and Minecraft LAN discovery;
+JavaHost 1.1.2 also hardens the stop path and prints a per-start diagnostic with
+the server type and plugin/mod counts. v1.2.0 is an **in-place upgrade of
+1.1.6** (same signing key), so settings and instances are kept.
 
 ## Project layout
 

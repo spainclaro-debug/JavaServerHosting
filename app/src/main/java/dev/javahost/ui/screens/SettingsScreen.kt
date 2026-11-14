@@ -156,6 +156,31 @@ fun SettingsScreen(
                 }
             }
 
+            /* ---------------- LAN discovery ---------------- */
+            SectionCard(title = "LAN discovery", subtitle = "Minecraft only") {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("Minecraft LAN discovery announcement", style = MaterialTheme.typography.bodyLarge)
+                        Text(
+                            "Broadcast the running Minecraft server so it shows in the game's LAN list. " +
+                                "Off = manual address only.",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    Switch(
+                        checked = settings.minecraftLanDiscovery,
+                        onCheckedChange = actions::setMinecraftLanDiscovery
+                    )
+                }
+                Text(
+                    "The phone and the client device must be on the same Wi-Fi network or hotspot. " +
+                        "Mobile data and VPNs usually block LAN discovery.",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+
             /* ---------------- Notifications ---------------- */
             SectionCard(title = "Notifications") {
                 if (notificationsGranted) {

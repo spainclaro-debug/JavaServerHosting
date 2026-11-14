@@ -33,6 +33,23 @@ evidence), **Manual-only** (requires a physical device; see `TESTING.md`).
 | Generic: no Minecraft UI, file manager + free-text JVM args, "Advanced / Experimental" | Implemented | Create/Detail/Home labels; Files/Console/args; MC routes guarded |
 | Shaders: omit/relabel, no dead button | Omitted; no shader control anywhere (grep clean) | — |
 
+## LAN access & discovery (1.2.0)
+
+| Requirement | Status | Where |
+|---|---|---|
+| LAN address resolution: Wi-Fi/ethernet/hotspot only, private IPv4 only, cellular/VPN/virtual rejected, multi-address deduplicated + sorted list | Verified (pure-JVM selector unit-tested; Android enumeration compile-tested) | `core/net/LanAddress.kt`, `core/net/AndroidLanInfo.kt`, `ServerManager`, LAN card |
+| LAN reachability self-test: TCP connect from the phone to its own LAN IP:port with `REACHABLE`/`REFUSED`/`TIMEOUT`/`ERROR` and actionable messages | Verified (probe unit-tested with hermetic fakes; UI wiring compile-tested) | `core/net/LanProbe.kt`, `ServerController.probeLan`, `ServerDetailScreen.kt` |
+| Minecraft LAN discovery announcement: `[MOTD]…[/MOTD][AD]<port>[/AD]` to UDP multicast `224.0.2.60:4445` every ~1.5 s, `MulticastLock`, sanitised MOTD, settings toggle | Payload/sanitiser unit-tested; multicast path **Manual-only** (needs real Wi-Fi) | `core/net/MinecraftLanAnnouncement.kt`, `MinecraftLanAnnouncer.kt`, `AppSettings.minecraftLanDiscovery` |
+| `server-ip` handling: loopback (`127.x`, `::1`, `localhost`) normalised to all-interfaces before start; typed Bind address field with validation and loopback warning | Implemented + unit tested | `ServerPropertiesCodec.kt`, `PropertiesScreen.kt`, `ServerManager.start` |
+| LAN UI: server-screen LAN card (labels, `address:port`, copy button, probe rows, connectivity warning/summary) and Minecraft announcement toggle | Implemented (Compose; compile-tested) | `ServerDetailScreen.kt`, `SettingsScreen.kt`, `AppViewModel.kt` |
+| New permissions `CHANGE_WIFI_MULTICAST_STATE` and `ACCESS_LOCAL_NETWORK` | Implemented in the manifest; `ACCESS_LOCAL_NETWORK` is forward compatibility only and is not requested at runtime | `AndroidManifest.xml` |
+
+Note: the app still has `targetSdk = 28`, so neither permission is enforced on
+current Android releases. `CHANGE_WIFI_MULTICAST_STATE` is a normal permission
+used for the LAN announcement; `ACCESS_LOCAL_NETWORK` is declared ahead of
+Android 17's local-network consent (Android 16 opt-in equivalent) so a future
+higher-target build is ready for it.
+
 ## Process persistence
 
 | Requirement | Status | Where |
@@ -88,10 +105,13 @@ evidence), **Manual-only** (requires a physical device; see `TESTING.md`).
 6. **OOM kills are silent** — continuous transcript (`logs/console.log`), crash reports, conservative default heap, restart prompt.
 7. **Play policy risk** — APK targetSdk 28; `docs/POLICY.md` documents the sideload strategy and a Play variant would need a different execution strategy and the media hack removed.
 8. **JRE size** — not in APK; downloaded from Termux mirrors with SHA-256 verification (~96–117 MB per major, ~170 MB installed).
+9. **LAN discovery is best-effort** — the Minecraft announcement is an emulation of “Open to LAN”, not a protocol dedicated servers implement. Clients must be on the same Wi-Fi/hotspot; AP/client isolation and guest networks block LAN traffic; some clients/versions do not scan the LAN list, and Bedrock clients still need Geyser/Floodgate. The LAN card's manual address is authoritative.
 
 ## Not testable in this environment
 
-On-device FGS/Doze/swipe/notification rendering, SAF provider interactions and
-actual `exec()` from the app sandbox on a retail ROM: no device/emulator/ADB was
-available. `docs/TESTING.md` marks these as manual-only and provides the full
-checklist; the host-level integration evidence is in that file.
+On-device FGS/Doze/swipe/notification rendering, SAF provider interactions,
+actual `exec()` from the app sandbox on a retail ROM, and the real-network LAN
+paths (multicast announcement, AP/client isolation, Android 16/17 local-network
+consent): no device/emulator/ADB was available. `docs/TESTING.md` marks these as
+manual-only and provides the full checklist; the host-level integration evidence
+is in that file.

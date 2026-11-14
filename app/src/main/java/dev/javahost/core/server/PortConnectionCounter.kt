@@ -7,9 +7,10 @@ import java.io.File
  * (and tcp6). This gives generic Java servers a meaningful "connections" stat
  * instead of Minecraft's player count.
  *
- * Android apps can normally read their own network namespace's `/proc/net/tcp`;
- * when the kernel/SELinux denies it, [count] returns null and the UI shows
- * "n/a" rather than inventing a number.
+ * AOSP SELinux blocks app access to `/proc/net/tcp` (`neverallow` on
+ * `proc_net_tcp_udp`), so on Android 10+ this normally returns null and the UI
+ * shows "n/a". The parser is still useful on ROMs/kernels that permit it and is
+ * unit-tested; callers must never invent a number when it returns null.
  */
 object PortConnectionCounter {
 

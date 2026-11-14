@@ -122,6 +122,8 @@ data class AppSettings(
     val termuxMirror: String = "",
     val lastActiveInstanceId: String? = null,
     val consoleLogLimit: Int = 5000,
+    /** Announce a running Minecraft server on the LAN (multicast discovery). */
+    val minecraftLanDiscovery: Boolean = true,
     val autoRestartOnCrash: Boolean = false,
     val notificationsRequested: Boolean = false,
     val firstServerAdded: Boolean = false,
@@ -151,6 +153,54 @@ data class ConsoleEntry(
     val text: String
 )
 
+/* ------------------------------------------------------------------------- */
+/* LAN access / discovery models                                             */
+/* ------------------------------------------------------------------------- */
+
+/** One address clients on the local network can try for the running server. */
+data class LanEndpointInfo(
+    val address: String,
+    val interfaceName: String,
+    val label: String,
+    /** "192.168.1.50:25565" — always present when a port is known. */
+    val hostPort: String? = null,
+    /** "http://192.168.1.50:4567/" for web/HTTP servers (generic JARs). */
+    val url: String? = null
+)
+
+/** Result of the app's own TCP reachability self-test against one LAN address. */
+data class LanProbeInfo(
+    val address: String,
+    val port: Int,
+    val result: String,
+    val ok: Boolean,
+    val latencyMs: Long? = null,
+    val detail: String? = null
+)
+
+/**
+ * Everything the UI needs to describe how other devices can reach the server:
+ * the usable LAN addresses, the port, the phone's connectivity state, the
+ * reachability self-test and the one-line warnings/help text.
+ */
+data class LanStatus(
+    val endpoints: List<LanEndpointInfo> = emptyList(),
+    val port: Int? = null,
+    val wifiConnected: Boolean = false,
+    val ethernetConnected: Boolean = false,
+    val mobileDataConnected: Boolean = false,
+    val vpnActive: Boolean = false,
+    /** Minecraft only: multicast LAN discovery announcement is active. */
+    val announcementEnabled: Boolean = false,
+    val probes: List<LanProbeInfo> = emptyList(),
+    /** Blocking problem the user must fix (no LAN address, VPN, loopback bind). */
+    val warning: String? = null,
+    /** Short actionable line ("Add server 192.168.1.50:25565 in Minecraft"). */
+    val summary: String? = null
+) {
+    val hasEndpoint: Boolean get() = endpoints.isNotEmpty()
+}
+
 /** Live status of the (single) active server. */
 data class ServerRuntimeStatus(
     val state: RunState = RunState.STOPPED,
@@ -170,7 +220,9 @@ data class ServerRuntimeStatus(
     val deviceAvailMb: Long = 0L,
     val deviceTotalMb: Long = 0L,
     val ready: Boolean = false,
-    val lastExit: ExitInfo? = null
+    val lastExit: ExitInfo? = null,
+    /** LAN reachability snapshot for the active server. */
+    val lan: LanStatus = LanStatus()
 ) {
     val isActive: Boolean
         get() = state == RunState.STARTING || state == RunState.RUNNING || state == RunState.STOPPING

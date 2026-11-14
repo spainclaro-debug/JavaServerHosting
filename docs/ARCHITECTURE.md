@@ -191,6 +191,106 @@ unsupported class version, missing library, EULA, signal 137 / system kill,
 unknown), written to `crashes/`, persisted on the instance, and surfaced in the
 UI and in a notification with a restart action.
 
+## LAN access & discovery
+
+Android phones are not obvious LAN hosts: Wi-Fi frequently blocks the multicast
+Minecraft uses for LAN discovery, the first non-loopback IPv4 is often the
+cellular or VPN interface, and a dedicated Minecraft server never announces
+itself. 1.2.0 adds a small LAN layer under `core/net/` plus a LAN card on the
+server screen.
+
+### Address selection (`LanAddress.kt`)
+
+`LanAddressSelector.select()` turns raw `NetworkInterface`s into the addresses
+the UI shows. It is pure JVM code and fully unit-tested. An entry survives only
+if it is up, not loopback, not point-to-point, a strict dotted-quad **private**
+IPv4 address (10/8, 172.16/12, 192.168/16 only), and comes from an accepted
+interface. Duplicate addresses are removed (higher-priority kind wins), then
+entries are sorted by kind priority, interface name and address.
+
+| Interface name patterns | Kind | Used for LAN? |
+|---|---|---|
+| `wlan*` | Wi-Fi | ✅ |
+| `eth*`, `usb*`, `rndis*` | Ethernet / USB tether | ✅ |
+| `ap*`, `softap*` | Hotspot | ✅ |
+| `ccmni*`, `rmnet*`, `seth*`, `pdp*`, `clat*`, `rmnet_data*` | Cellular | ❌ rejected |
+| `tun*`, `tap*`, `ppp*`, `wg*`, `ipsec*`, `v4-*`, `ip6tnl*`, `sit*`, `dummy*`, `ifb*`, `p2p*`, `swlan*`, `bond*` | VPN / virtual | ❌ rejected |
+
+Empty input or everything filtered returns `emptyList()` instead of throwing.
+`AndroidLanInfo` supplies the raw interfaces (`NetworkInterface`), the
+connectivity state (`ConnectivityManager`: Wi-Fi / ethernet / mobile data / VPN),
+the `MulticastLock`, and the preferred `NetworkInterface` for the announcement
+socket. All Android calls are wrapped so missing permissions or services degrade
+to an empty state rather than a crash.
+
+### Reachability self-test (`LanProbe.kt`)
+
+“Test LAN reachability” opens a TCP socket from the phone to its **own LAN
+IP:port** (`SocketTcpProbe`, 2.5 s connect timeout with one retry on timeout).
+This is exactly the path a
+client takes through the network stack, and unlike `localhost` it fails when the
+server is bound to loopback or the interface is wrong. Results are `REACHABLE`
+(with measured latency), `REFUSED` (connection refused / no route), `TIMEOUT`, or
+`ERROR`; the UI renders them per address, and `ServerManager.probeLan()` republishes
+`ServerRuntimeStatus.lan`. The outcome is advisory: the probe goes from the
+phone to itself, so it validates the bind and the phone's TCP stack but cannot
+detect router-side AP/client isolation or a client firewall.
+
+### Minecraft LAN announcement (`MinecraftLanAnnouncement.kt`, `MinecraftLanAnnouncer.kt`)
+
+Minecraft's “Open to LAN” broadcasts on UDP multicast group `224.0.2.60`,
+port `4445`, with the payload
+
+```
+[MOTD]<motd>[/MOTD][AD]<port>[/AD]
+```
+
+Dedicated servers do not send this. When the **Minecraft LAN discovery
+announcement** toggle is on (default), JavaHost sends that datagram every
+`INTERVAL_MS = 1500` ms for the running Minecraft server: TTL 1, socket bound to
+an ephemeral port, `setNetworkInterface` pointing at the preferred LAN interface
+when possible, and a `WifiManager` `MulticastLock` taken when the platform allows
+it. The lock is a receive-side optimisation: sending multicast only needs
+`INTERNET`, so a missing lock never disables discovery. MOTDs are sanitised (control
+characters/CR/LF stripped, `[`/`]` escaped, trimmed, max 100 chars, fallback
+`Minecraft server`). Per-tick failures are reported at most once per 30 s and do
+not stop the loop; `stop()` cancels the job, closes the socket and releases the
+lock. This is best-effort: clients must be on the same Wi-Fi/hotspot and some
+clients/versions do not scan the LAN list, so the manual address from the LAN card
+remains the authoritative fallback.
+
+### `server-ip` normalization
+
+`ServerPropertiesCodec` gains `server-ip` as a known key plus
+`isLoopbackBind()` and `normalizeBindAddress()`. Before launch, a loopback bind
+(`127.x.x.x`, `::1`, `localhost`) is normalised to an empty value so the JVM
+listens on all interfaces instead of failing LAN clients silently. The typed
+**Bind address (server-ip)** field in the properties editor warns on loopback
+values; blank means all interfaces (recommended).
+
+### Local-network permission and forward compatibility
+
+The manifest declares `CHANGE_WIFI_MULTICAST_STATE` (multicast lock) and
+`ACCESS_LOCAL_NETWORK` (Android 17's local-network runtime permission; Android 16
+has an opt-in equivalent). The app targets API 28, so neither is enforced today;
+`ACCESS_LOCAL_NETWORK` is declared now so a future build targeting a newer SDK
+has the permission in place. The current runtime consent flow is not requested
+from the app yet; the LAN card explains OS/network blockers instead.
+
+### Security note
+
+JavaHost now **intentionally makes the running server reachable on the local
+network**: it prints reachable LAN addresses and, for Minecraft, advertises the
+server on the LAN via multicast. This is the same reachability a server already
+had when bound to all interfaces — the app removes the guesswork, it does not
+create a new internet exposure: only devices on the same LAN can connect, and the
+default Android app sandbox is unchanged. On networks you do not trust, keep the
+server's own authentication (`online-mode`, white-list) and turn off the
+Minecraft announcement if you do not want the server listed; because loopback
+`server-ip` values are normalised away, stopping the server is what ends LAN
+access. The app still does not request root, all-files access or any dangerous
+runtime permission.
+
 ## Persistence stack
 
 - `foreground service` (specialUse) + ongoing notification

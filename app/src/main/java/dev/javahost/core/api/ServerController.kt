@@ -58,6 +58,13 @@ interface ServerController {
      */
     fun forceStop(): Boolean = false
 
+    /**
+     * Re-resolve the LAN addresses of the running server, TCP-probe each one and
+     * publish the result to [ServerRuntimeStatus.lan] (the UI's "Test LAN
+     * reachability" action). Returns false when no server is active.
+     */
+    fun probeLan(): Boolean = false
+
     /** Called when the service is being destroyed; must not leave a JVM behind. */
     fun shutdown()
 
