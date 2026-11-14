@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">JavaHost</string>
+    <string name="app_tagline">Host Java servers on your phone</string>
+
+    <string name="notification_channel_server">Server status</string>
+    <string name="notification_channel_server_desc">Ongoing notification while a Java server is running</string>
+    <string name="notification_channel_alerts">Server alerts</string>
+    <string name="notification_channel_alerts_desc">Crashes, unexpected exits and restart prompts</string>
+    <string name="notification_channel_downloads">Downloads</string>
+    <string name="notification_channel_downloads_desc">JRE and plugin download progress</string>
+
+    <string name="notification_stop">Stop</string>
+    <string name="notification_restart">Restart</string>
+    <string name="notification_force_stop">Force stop</string>
+    <string name="notification_open">Open console</string>
+    <string name="notification_running">Server running</string>
+    <string name="notification_stopped">Server stopped</string>
+</resources>
