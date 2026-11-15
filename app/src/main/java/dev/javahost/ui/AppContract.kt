@@ -35,6 +35,12 @@ data class AppUiState(
     val settings: AppSettings = AppSettings(),
     val instances: List<ServerInstance> = emptyList(),
     val runtime: ServerRuntimeStatus = ServerRuntimeStatus(),
+    /**
+     * Per instance id: true when a Geyser plugin/mod is installed on disk. Detected
+     * independently of a running server so the LAN card can offer the Bedrock bridge
+     * while the instance is stopped.
+     */
+    val bedrockDetected: Map<String, Boolean> = emptyMap(),
     val activeInstanceId: String? = null,
     val jres: List<JreInstallation> = emptyList(),
     val jreJobs: Map<String, JobProgress> = emptyMap(),
@@ -121,6 +127,13 @@ interface AppActions {
 
     /** Enable/disable the Minecraft LAN discovery announcement for running servers. */
     fun setMinecraftLanDiscovery(enabled: Boolean)
+
+    /**
+     * Enable/disable the Bedrock Edition LAN bridge (Geyser on UDP 19133, app relay
+     * on UDP 19132). Takes effect on the next server start/restart because Geyser's
+     * port is fixed when the JVM launches.
+     */
+    fun setBedrockLanDiscovery(enabled: Boolean)
 
     // --- settings --------------------------------------------------------------
     fun setDefaultMemory(mb: Int)

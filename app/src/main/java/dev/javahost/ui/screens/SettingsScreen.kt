@@ -179,6 +179,23 @@ fun SettingsScreen(
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
+                HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.3f))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("Bedrock LAN discovery bridge", style = MaterialTheme.typography.bodyLarge)
+                        Text(
+                            "Moves Geyser to UDP 19133 and announces your phone's LAN address on UDP " +
+                                "19132 so Bedrock clients see the server in LAN/Friends. Requires Geyser + " +
+                                "Floodgate on a Paper server; applies after the next server start/restart.",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    Switch(
+                        checked = settings.bedrockLanDiscovery,
+                        onCheckedChange = actions::setBedrockLanDiscovery
+                    )
+                }
             }
 
             /* ---------------- Notifications ---------------- */

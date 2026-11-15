@@ -2,6 +2,7 @@ package dev.javahost.core.net
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -420,5 +421,110 @@ class LanAddressTest {
             ),
             result
         )
+    }
+
+    // ------------------------------------------------------------------
+    // Subnet broadcast for the Bedrock LAN beacon (1.3.0 additions)
+    // ------------------------------------------------------------------
+
+    @Test
+    fun `subnet broadcast for common home network prefixes`() {
+        assertEquals("10.255.255.255", LanAddressSelector.subnetBroadcast("10.20.30.40", 8))
+        assertEquals("172.16.255.255", LanAddressSelector.subnetBroadcast("172.16.5.4", 16))
+        assertEquals("192.168.1.255", LanAddressSelector.subnetBroadcast("192.168.1.50", 24))
+        assertEquals("192.168.1.127", LanAddressSelector.subnetBroadcast("192.168.1.50", 25))
+        assertEquals("192.168.1.7", LanAddressSelector.subnetBroadcast("192.168.1.5", 30))
+        assertEquals("192.168.1.5", LanAddressSelector.subnetBroadcast("192.168.1.5", 31))
+    }
+
+    @Test
+    fun `subnet broadcast of a slash 32 is the address itself`() {
+        assertEquals("192.168.1.50", LanAddressSelector.subnetBroadcast("192.168.1.50", 32))
+        assertEquals("10.0.0.1", LanAddressSelector.subnetBroadcast("10.0.0.1", 32))
+    }
+
+    @Test
+    fun `subnet broadcast handles edge prefixes`() {
+        assertEquals("127.255.255.255", LanAddressSelector.subnetBroadcast("0.0.0.0", 1))
+        assertEquals("255.255.255.255", LanAddressSelector.subnetBroadcast("128.0.0.1", 1))
+        assertEquals("255.255.255.255", LanAddressSelector.subnetBroadcast("255.255.255.255", 24))
+        assertEquals("192.168.255.255", LanAddressSelector.subnetBroadcast("192.168.0.0", 16))
+    }
+
+    @Test
+    fun `subnet broadcast rejects out of range prefixes`() {
+        assertNull(LanAddressSelector.subnetBroadcast("192.168.1.50", 0))
+        assertNull(LanAddressSelector.subnetBroadcast("192.168.1.50", -1))
+        assertNull(LanAddressSelector.subnetBroadcast("192.168.1.50", 33))
+        assertNull(LanAddressSelector.subnetBroadcast("192.168.1.50", Int.MAX_VALUE))
+    }
+
+    @Test
+    fun `subnet broadcast rejects malformed addresses`() {
+        for (address in listOf(
+            "",
+            " ",
+            "192.168.1",
+            "192.168.1.5.6",
+            "192.168.1.256",
+            "192.168.1.-1",
+            "192.168.1.5a",
+            "192.168.1.5:80",
+            "192.168.1.5/24",
+            " 192.168.1.5",
+            "192.168.1.5 ",
+            "abc",
+            "10..0.1"
+        )) {
+            assertNull("\"$address\" must be rejected", LanAddressSelector.subnetBroadcast(address, 24))
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Prefix-length propagation (1.3.0 additions)
+    // ------------------------------------------------------------------
+
+    private fun ifaceWithPrefix(name: String, address: String, prefixLength: Int) =
+        LanInterface(
+            name = name,
+            address = address,
+            isUp = true,
+            isLoopback = false,
+            isPointToPoint = false,
+            prefixLength = prefixLength
+        )
+
+    @Test
+    fun `prefix length defaults to 24`() {
+        assertEquals(24, LanInterface("wlan0", "192.168.1.50").prefixLength)
+        assertEquals(24, LanEndpoint("192.168.1.50", "wlan0", LanKind.WIFI, "Wi-Fi").prefixLength)
+    }
+
+    @Test
+    fun `selection copies the interface prefix length into the endpoint`() {
+        val result = LanAddressSelector.select(
+            listOf(ifaceWithPrefix("wlan0", "192.168.1.50", prefixLength = 16))
+        )
+        assertEquals(1, result.size)
+        assertEquals(16, result.single().prefixLength)
+    }
+
+    @Test
+    fun `selection keeps the default prefix length when the interface has none`() {
+        val result = LanAddressSelector.select(listOf(iface("wlan0", "192.168.1.50")))
+        assertEquals(24, result.single().prefixLength)
+    }
+
+    @Test
+    fun `dedupe keeps the prefix length of the surviving interface`() {
+        val result = LanAddressSelector.select(
+            listOf(
+                ifaceWithPrefix("eth0", "192.168.1.50", prefixLength = 16),
+                ifaceWithPrefix("wlan0", "192.168.1.50", prefixLength = 24)
+            )
+        )
+        assertEquals(1, result.size)
+        assertEquals("wlan0", result.single().interfaceName)
+        assertEquals(24, result.single().prefixLength)
     }
 }

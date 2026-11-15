@@ -1,5 +1,17 @@
 # Troubleshooting
 
+## Upgrading from 1.2.0
+
+The JavaHost 1.3.0 APK is signed with the same development key as 1.2.0 and
+installs as an **in-place upgrade**: server instances, worlds, plugins, the
+installed JRE and settings are kept. The Bedrock LAN bridge is on by default and
+takes effect at the next server start/restart; enabling it edits the Geyser
+`config.yml` `bedrock.port` (19133), `bedrock.transport` (`both`, when the key
+exists) and `bedrock.webrtc-port` (19134, when the key exists). Only the port is
+restored when you turn the bridge off — `transport: both` and `webrtc-port:
+19134` stay so both Bedrock client generations keep working. Back up
+`plugins/Geyser-*/config.yml` if you hand-tuned Geyser settings.
+
 ## Upgrading from 1.1.6
 
 The JavaHost 1.2.0 APK is signed with the same development key as 1.1.6 and
@@ -159,6 +171,118 @@ If the app's self-test is `REACHABLE` and the address is correct but another
 device still cannot connect, the block is in the router/network, not in
 JavaHost; see the router isolation steps above.
 
+## “Bedrock clients cannot see or join the server (LAN/Friends)”
+
+Bedrock Edition is a different protocol from Java. The app can only make a
+**working Geyser setup discoverable** on the LAN; it does not translate Bedrock
+itself. Requirements:
+
+1. A **Paper/Spigot** server (not Vanilla/Fabric/Forge) with **Geyser-Spigot**
+   and **Floodgate** installed in `plugins/` (Mods & plugins, or Files).
+2. **Bedrock LAN bridge (Geyser)** switched on — server LAN card → Bedrock block,
+   or **Settings → Bedrock LAN discovery bridge**. It is on by default.
+3. **Restart the whole server** after switching it on. The bridge is applied at
+   the next start: it moves Geyser from UDP 19132 to 19133, sets
+   `bedrock.transport: both` (Geyser 2.12.1 defaults to NetherNet, which would
+   otherwise leave no RakNet listener for LAN discovery) and moves NetherNet's
+   WebRTC port to UDP 19134, then starts the relay on 19132.
+4. Client and phone on the **same Wi-Fi/hotspot**, no VPN and no mobile-data-only
+   phone. AP/client isolation, guest networks and router broadcast filtering
+   still block **discovery** (see the end of this section).
+
+**What the LAN card should show when it works:** a **Bedrock Edition** block with
+the bridge address `<phone-ip>:19132` **and** Geyser's direct address
+`<phone-ip>:19133` for every usable LAN address (copy buttons), plus a status
+line like “Bedrock clients can join 192.168.1.50:19132 (Geyser <version> ·
+<players> · "<motd>")” once Geyser has answered the app's ping. While Geyser is
+still starting the card warns that the bridge is running but Geyser did not
+answer on UDP 19133; if UDP 19132 could not be bound it shows a different warning
+instead.
+
+**Console lines to look for:**
+
+```
+Bedrock Edition: JavaHost's Bedrock LAN bridge listens on UDP 19132 ...
+Bedrock bridge: moved Geyser from UDP 19132 to UDP 19133 and set transport to "both" ... (NetherNet WebRTC UDP moved to 19134) in plugins/Geyser-.../config.yml ...
+Bedrock LAN bridge: listening on UDP 19132 and forwarding to Geyser on UDP 19133 ...
+Bedrock LAN bridge ready: ... Manual Add Server for the LAN bridge: <ip>:19132. Newer Bedrock versions that switched to NetherNet may need the Geyser direct address instead: Add Server <ip>:19133. ...
+```
+
+Geyser's own startup line should read `Started Geyser on 0.0.0.0:19133`. If
+Geyser still logs `Started Geyser on 0.0.0.0:19132`, or logs no RakNet “Started
+Geyser” line at all (Geyser 2.12.1 with its NetherNet default), the bridge was
+not applied: turn the setting on, stop the server fully and start it again, and
+check the console for the app's `Bedrock bridge:` lines.
+
+**If the server does not appear in LAN/Friends:** use Bedrock's manual
+**Add Server** with `<phone-ip>:19132` (UDP, not the Java 25565 port). If manual
+join works but the list stays empty, the server is fine and only discovery or
+broadcast delivery is blocked — see the last items below.
+
+**Newer Bedrock clients (26.60+, NetherNet).** Bedrock 26.60 (October 2026)
+clients stopped joining over RakNet and use Geyser's NetherNet/WebRTC transport
+instead (Geyser's NetherNet transition — see the Geyser blog/release notes). The
+19132 bridge is the **RakNet LAN-discovery + relay** path: it restores LAN/Friends listing and join for RakNet-era clients and for a Geyser
+running `transport: both`, but a NetherNet-only client may not join through
+19132. For those clients use the LAN card's **Geyser direct** address:
+**Add Server `<phone-ip>:19133`**. The bridge already sets `transport: both` and
+moves NetherNet's WebRTC traffic to UDP 19134, so the direct path is enabled by
+default once the bridge is on.
+
+Two caveats: on Android/bionic Geyser's NetherNet native library may fail to
+load — the console shows “Geyser's NetherNet/WebRTC transport cannot load its
+native library on Android/bionic…” and that is a plugin-native limitation, not a
+JavaHost bug, so NetherNet-only clients may not be able to join on this phone.
+Also, some 2026 clients fail to list a server even when it returns a valid pong
+(Mojang bug **MCPE-239883**), so treat manual Add Server as the reliable path.
+
+**“Unable to connect to world” / kicked straight after joining:**
+
+- **Floodgate** must be installed and configured (it lets Bedrock clients join
+  without Java accounts). If the console shows Floodgate/key errors, reinstall
+  the Floodgate JAR and its generated key/config, then restart.
+- With `online-mode=true` and **no Floodgate**, Bedrock clients are rejected as
+  unauthenticated; install Floodgate or (for a private server) set
+  `online-mode=false` and use a white-list.
+- **Version mismatch** — update the Bedrock client or Geyser. ViaVersion /
+  ViaBackwards only help **Java** clients; they do not make a Bedrock client
+  compatible with the server.
+- **NetherNet-only client** — if a Bedrock 26.60+ client cannot join on 19132,
+  try `<phone-ip>:19133` (Geyser direct). If that also fails and the console
+  shows the NetherNet native-library warning above, the client cannot join over
+  NetherNet on this Android build.
+- Server full, whitelist, `max-players` or a world still loading — the console
+  says which; retry after “Done”.
+
+**If the card says Geyser is not reachable / the bridge is not running:**
+
+- Check Geyser is actually in this instance's `plugins/` (Mods & plugins →
+  Installed plugins), not another instance.
+- Restart the server and confirm the console reaches Geyser's “Started Geyser”
+  line without port-in-use errors.
+- Another app (or a hung previous run) may hold UDP 19132 or 19133. Force stop
+  the server/app, then start again; the card warns when 19132 is busy.
+- Verify `plugins/Geyser-*/config.yml`: after start, `bedrock.port` should be
+  `19133`, `bedrock.transport` should be `both` and `bedrock.webrtc-port` should
+  be `19134` (unless the Geyser build honours the `GEYSER_BEDROCK_PORT`,
+  `GEYSER_BEDROCK_TRANSPORT`, `GEYSER_BEDROCK_WEBRTC_PORT` and
+  `GEYSER_BEDROCK_ADDRESS` environment overrides, which JavaHost always sets).
+  If `transport` stayed `nethernet`, Geyser has no RakNet listener for the
+  bridge to ping: set `transport: both` and `webrtc-port: 19134` in the config
+  (or let the app patch it) and restart.
+- The console warns after about a minute: “waiting on UDP 19132 but Geyser is not
+  answering RakNet on UDP 19133 …” — that means Geyser has not bound the RakNet
+  listener yet or the transport patch did not take effect.
+
+**Discovery still blocked?** These are network-side, not app-side: router
+AP/client isolation, “multicast/broadcast filtering” or guest Wi-Fi; a Windows
+client firewall (allow Minecraft for UDP `4445` and `19132`, and `19133` when
+using the NetherNet direct fallback, on private networks); console Bedrock
+builds that hide the LAN list or the Add Server UI (behaviour varies by platform
+and version — use a build that allows manual servers). The manual
+`<phone-ip>:19132` (or `<phone-ip>:19133` for NetherNet-era clients) Add Server
+path keeps working when only broadcasts are filtered.
+
 ## “A JAR import fails with duplicate entry (LICENSE) / not a valid archive”
 
 Some Spring Boot fat JARs (for example **Suwayomi**) contain duplicate `LICENSE`
@@ -181,8 +305,10 @@ Check in this order:
    if needed) on a **Paper/Spigot** server, or use a client version matching the
    server (`server.properties`/Paper version).
 2. **Bedrock vs Java** — Bedrock clients need **Geyser + Floodgate** running on a
-   Paper/Spigot server, plus UDP port 19132; Java clients need the Java port
-   (25565 by default).
+   Paper/Spigot server, plus UDP port 19132 through the app's Bedrock LAN bridge
+   (newer NetherNet-era clients may need Geyser's direct `<phone-ip>:19133`); Java
+   clients need the Java port (25565 by default). See “Bedrock clients cannot see
+   or join the server” above.
 3. **Vanilla + plugins** — see above. A Vanilla JAR will never load ViaVersion,
    so the client/server version mismatch remains.
 4. **online-mode / authentication** — a server with `online-mode=true` requires a

@@ -12,10 +12,10 @@ Run:
 ./gradlew :app:testDebugUnitTest
 ```
 
-Final run in this environment for the 1.2.0 suite: **327 hermetic tests,
-0 failures, 0 errors, 3 skipped** (253 before this release; the skipped tests are environment-gated
-real-archive/real-JRE smoke tests that only run when their fixture variables are
-provided).
+Final run in this environment for the 1.3.0 suite: **419 hermetic tests,
+0 failures, 0 errors, 3 skipped** (327 before this release; the skipped tests are
+environment-gated real-archive/real-JRE smoke tests that only run when their
+fixture variables are provided).
 
 Coverage by area:
 
@@ -27,7 +27,8 @@ Coverage by area:
 | Crash classification | OOM, port in use, unsupported class version, missing library, EULA, signal 137, unknown |
 | JRE pipeline | Termux `Packages` parsing, dependency resolution, `ar`/`.deb` extraction with synthetic archives, traversal rejection, cacerts overlay, archive import (tar.xz/gz/zip), folder-layout/java-home discovery, bionic-vs-glibc ELF validation, arm64 `OS_ARCH` checks, permissions, release file |
 | Storage | `ServerPropertiesCodecTest` — `server.properties` parse/format (comments/order/unknown keys), port validation, `server-ip` get/set/loopback-normalisation cases; `FileBrowserSafetyTest` — path/symlink containment |
-| LAN (new in 1.2.0) | `core/net/LanAddressTest` — private-IPv4/loopback checks, cellular/VPN interface rejection, kind classification/labels, dedupe and `WIFI < ETHERNET < HOTSPOT < OTHER` ordering, empty/all-filtered input; `core/net/MinecraftLanAnnouncementTest` — message/payload format, MOTD sanitisation, port validation; `core/net/LanProbeTest` — `REACHABLE`/`REFUSED`/`TIMEOUT`/`ERROR` mapping, latency, host/port validation, no exception on bad input; plus the `server-ip` cases in `ServerPropertiesCodecTest` |
+| LAN (new in 1.2.0) | `core/net/LanAddressTest` — private-IPv4/loopback checks, cellular/VPN interface rejection, kind classification/labels, dedupe and `WIFI < ETHERNET < HOTSPOT < OTHER` ordering, subnet broadcast maths (`/8`, `/24`, `/32`, invalid), empty/all-filtered input; `core/net/MinecraftLanAnnouncementTest` — message/payload format, MOTD sanitisation, port validation; `core/net/LanProbeTest` — `REACHABLE`/`REFUSED`/`TIMEOUT`/`ERROR` mapping, latency, host/port validation, no exception on bad input; plus the `server-ip` cases in `ServerPropertiesCodecTest` |
+| Bedrock (new in 1.3.0) | `core/net/BedrockRakNetTest` — ping detection/build, pong parse/build, MAGIC and length checks, `MCPE;…` server-id parse/build round-trips with missing ports and unknown trailing fields, pong rewrite (port/GUID, echoed ping time preserved) invalid-input safety; `core/net/BedrockLanRelayTest` — loopback UDP harness: client ping bytes forwarded unchanged and the reply pong rewritten with the advertised port + relay GUID, non-ping datagrams relayed both ways through a mock upstream socket, two clients isolated, busy port (no `SO_REUSEADDR`) makes `start()` return false, a non-positive beacon interval sends no unsolicited pong bytes, idle/stop cleanup; `core/net/BedrockGeyserConfigTest` — config discovery, modern `bedrock:`/`port:` and legacy `bedrock-port:` patching, `prepareForBridge` transport/WebRTC cases (`transport` absent → no-op, `nethernet` → `both`, `webrtc-port 0` → `19134`, idempotent), comments/CRLF/indentation preserved, port-only restore happy/no-op, atomic write |
 | System | safe/auto heap math, battery/notification state helpers |
 | Misc | log rotation/tail, heap-sampler parsing, generic TCP connection counter, EULA text |
 
@@ -54,7 +55,7 @@ Android app sandbox, foreground service or Doze.
 | Modrinth API live smoke | ✅ search `worldedit` plugins for 1.20.4/paper returned hits; project versions returned a primary `.jar` (16 KB, SHA-1 present); file HEAD → HTTP 200. UA/facets/encoding validated manually; not part of the hermetic suite |
 | Termux mirror smoke (live) | ✅ `Packages.gz` 732 KB → parsed 3,029 packages; real `openjdk-21` deb chain downloaded with SHA-256 verification and extracted to a runnable JRE |
 | Mirror speed probe (host/dev network) | ✅ TUNA ~2.9 MB/s, MWT ~2.5 MB/s, Grimler ~1.4 MB/s, USTC ~0.7 MB/s, BFSU ~0.4 MB/s on a 3 MB range request; auto-probe ordering is unit-tested without network |
-| Full Gradle unit suite | ✅ 327 tests, 0 failures, 0 errors, 3 skipped |
+| Full Gradle unit suite | ✅ 419 tests, 0 failures, 0 errors, 3 skipped |
 
 ### LAN smoke check (JVM)
 
@@ -87,8 +88,39 @@ anything.
 4. **On-device follow-up:** run the LAN card + Minecraft client check in the
    manual checklist below; real multicast delivery depends on the access point.
 
+### Bedrock bridge smoke check (JVM)
+
+The hermetic Bedrock tests use loopback sockets with a mock upstream; this
+host-level check plays a real Bedrock client's part against the real relay
+classes (no Android device and no Geyser install needed):
+
+1. **Mock upstream.** Bind a `DatagramSocket` on loopback port `19133` that
+   answers a RakNet ping with a `BedrockRakNet.buildPong(...)` whose serverId
+   carries a test MOTD, version and advertised port `19132`.
+2. **Start the relay on an ephemeral port** (`listenPort = 0`) with
+   `upstreamPort = 19133` and `beaconIntervalMs = 0` (reply-only, exactly how
+   the app runs it in 1.3.0).
+3. **Ping it.** Send `BedrockRakNet.buildPing(time, guid)` to `boundPort`, parse
+   the pong and assert: the echoed `pingTime` equals the sent time (clients may
+   ignore mismatched pongs), the descriptor advertises the relay's bound port
+   and relay GUID while keeping the MOTD/version/players from the upstream, and
+   the upstream saw the client's ping bytes unchanged.
+4. **Relay gameplay bytes** through the bridge in both directions and assert they
+   arrive unchanged at the client and the mock upstream; check `stats()` counters
+   (clients, packets each way, pings answered).
+5. **Reply-only check.** With `beaconIntervalMs = 0`, assert no unsolicited pong
+   arrives on a second loopback listener for a few seconds.
+6. **Busy port.** Start a second relay bound to the same concrete port and assert
+   `start()` returns false with an error rather than throwing (the listening
+   socket deliberately has no `SO_REUSEADDR`).
+7. **On-device follow-up:** with Paper + Geyser + Floodgate, the LAN card must
+   show both `<ip>:19132` (bridge) and `<ip>:19133` (Geyser direct);
+   check a RakNet-era client on LAN/Friends and manual `<ip>:19132`, and note
+   whether a NetherNet-era client needs manual `<ip>:19133` (manual checklist
+   6e).
+
 Results for a release are recorded with that release's artifacts (see the
-v1.2.0 release).
+v1.3.0 release).
 
 Known host-level quirks observed:
 
@@ -142,6 +174,20 @@ Not executed in this build environment (no device or emulator attached).
    **Add Server** with the LAN card address to confirm manual play. Repeat on a
    guest network or with AP isolation enabled and confirm the docs' warning that
    no app-side fix exists.
+6e. **Bedrock LAN bridge** — on a Paper server with **Geyser-Spigot +
+   Floodgate** (2.12.1) installed, enable **Bedrock LAN bridge (Geyser)** and
+   restart the server. Confirm the console shows the app's `Bedrock bridge:`
+   lines (Geyser moved to UDP 19133, `transport: both`, WebRTC 19134),
+   `Started Geyser on 0.0.0.0:19133` and the bridge listening/ready lines, and
+   that the LAN card shows the bridge `<ip>:19132` **and** Geyser direct
+   `<ip>:19133` with “Geyser reachable”, MOTD, version and players. On the same
+   Wi-Fi: a **RakNet-era** Bedrock client must appear in LAN/Friends and join via
+   `<ip>:19132`; a **NetherNet-era client (26.60+)** may need manual **Add
+   Server** `<ip>:19133` — if Geyser's NetherNet native library fails to load on
+   this ROM, confirm the console explains it as a plugin-native limitation.
+   Then turn the bridge off, restart and confirm `bedrock.port` is restored to
+   its original value while `transport: both` and `webrtc-port: 19134` stay, and
+   that the bridge and discovery stop.
 7. **Screen off** — start a server, turn the screen off for 15+ minutes, confirm
    the process stays alive and the console keeps flowing.
 7. **Doze** — leave the device idle/unplugged for 30+ minutes with the
@@ -171,3 +217,9 @@ Not executed in this build environment (no device or emulator attached).
 - LAN multicast delivery, AP/client isolation and the Android 16/17 local-network
   consent can only be verified with a real phone plus an access point and a
   second client; the manual checklist items 6b–6d cover them.
+- Bedrock LAN discovery/relay needs a real Geyser + Floodgate server and real
+  Bedrock clients of **both** generations (RakNet-era and NetherNet-era, 26.60+);
+  the loopback relay tests and the JVM smoke check cover the protocol/relay
+  logic, but real broadcast/client listing, the NetherNet direct path and whether
+  Geyser's NetherNet native library loads on the phone are manual-only (checklist
+  item 6e).

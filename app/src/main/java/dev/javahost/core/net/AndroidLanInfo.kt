@@ -7,6 +7,7 @@ import android.net.NetworkCapabilities
 import android.net.wifi.WifiManager
 import android.util.Log
 import java.net.Inet4Address
+import java.net.InterfaceAddress
 import java.net.NetworkInterface
 
 /**
@@ -71,6 +72,9 @@ class AndroidLanInfo(context: Context) {
             if (!up || loopback || pointToPoint) continue
 
             val addresses = runCatching { nic.inetAddresses }.getOrNull() ?: continue
+            // CIDR prefixes live on InterfaceAddress; an unreadable list just means /24.
+            val interfaceAddresses = runCatching { nic.interfaceAddresses }
+                .getOrDefault(emptyList<InterfaceAddress>())
             while (addresses.hasMoreElements()) {
                 val ipv4 = addresses.nextElement() as? Inet4Address ?: continue
                 val siteLocal = runCatching { ipv4.isSiteLocalAddress }.getOrDefault(false)
@@ -87,7 +91,8 @@ class AndroidLanInfo(context: Context) {
                         address = host,
                         isUp = true,
                         isLoopback = false,
-                        isPointToPoint = false
+                        isPointToPoint = false,
+                        prefixLength = ipv4PrefixLength(interfaceAddresses, host)
                     )
                 )
             }
@@ -98,6 +103,29 @@ class AndroidLanInfo(context: Context) {
     /** Usable LAN endpoints, best Wi-Fi/ethernet address first, never cellular/VPN. */
     fun endpoints(): List<LanEndpoint> =
         runCatching { LanAddressSelector.select(interfaces()) }.getOrDefault(emptyList())
+
+    /**
+     * IPv4 prefix length (`/24` -> 24) that [NetworkInterface.interfaceAddresses]
+     * reports for [host], or [DEFAULT_IPV4_PREFIX_LENGTH] when the matching entry
+     * cannot be found or read. Used by the Bedrock LAN beacon to derive the
+     * subnet broadcast address, so a wrong value only widens/narrows the beacon
+     * target and never breaks the Java LAN card.
+     */
+    private fun ipv4PrefixLength(
+        interfaceAddresses: List<InterfaceAddress>,
+        host: String
+    ): Int = runCatching {
+        interfaceAddresses
+            .firstOrNull { candidate ->
+                runCatching { candidate.address.hostAddress }
+                    .getOrNull()
+                    ?.substringBefore('%')
+                    ?.trim() == host
+            }
+            ?.networkPrefixLength
+            ?.toInt()
+            ?.takeIf { prefix -> prefix in 1..32 }
+    }.getOrNull() ?: DEFAULT_IPV4_PREFIX_LENGTH
 
     /**
      * Reads the phone's connectivity: one flag per transport carrying a network.
@@ -180,6 +208,9 @@ class AndroidLanInfo(context: Context) {
     companion object {
         /** Tag of the Wi-Fi multicast lock; matches the contract. */
         const val MULTICAST_LOCK_TAG = "JavaHost:lan"
+
+        /** Prefix assumed when [NetworkInterface.interfaceAddresses] cannot provide one. */
+        private const val DEFAULT_IPV4_PREFIX_LENGTH = 24
 
         private const val TAG = "AndroidLanInfo"
     }

@@ -10,6 +10,7 @@ import dev.javahost.core.api.ServerController
 import dev.javahost.core.jar.JarInspector
 import dev.javahost.core.launch.LaunchPlan
 import dev.javahost.core.launch.LaunchPlanBuilder
+import dev.javahost.core.model.BedrockLanStatus
 import dev.javahost.core.model.ConsoleEntry
 import dev.javahost.core.model.ExitInfo
 import dev.javahost.core.model.ExitReason
@@ -24,6 +25,10 @@ import dev.javahost.core.model.ServerInstance
 import dev.javahost.core.model.ServerRuntimeStatus
 import dev.javahost.core.model.StartResult
 import dev.javahost.core.net.AndroidLanInfo
+import dev.javahost.core.net.BedrockGeyserConfig
+import dev.javahost.core.net.BedrockLanRelay
+import dev.javahost.core.net.BedrockRakNet
+import dev.javahost.core.net.LanAddressSelector
 import dev.javahost.core.net.LanEndpoint
 import dev.javahost.core.net.LanNetworkState
 import dev.javahost.core.net.LanProbeResult
@@ -59,7 +64,10 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import java.io.File
+import java.net.DatagramPacket
+import java.net.DatagramSocket
 import java.net.Inet4Address
+import java.net.InetAddress
 import java.net.NetworkInterface
 import java.time.Instant
 import java.util.Locale
@@ -160,6 +168,23 @@ class ServerManager(
     private var lanAnnouncer: MinecraftLanAnnouncer? = null
     private val lanProbeInFlight = AtomicBoolean(false)
 
+    // ---- Bedrock Edition bridge (Geyser on 19133, app on 19132) ----------
+    @Volatile
+    private var bedrockRelay: BedrockLanRelay? = null
+    private val bedrockClientGuid = kotlin.random.Random.nextLong()
+
+    /**
+     * What the Bedrock bridge needs for one launch: whether it applies, whether a
+     * Geyser plugin was found, the config file it may patch, and the environment
+     * overrides passed to the child JVM.
+     */
+    private data class BedrockBridgePlan(
+        val requested: Boolean,
+        val geyserDetected: Boolean,
+        val geyserConfig: File?,
+        val environment: Map<String, String>
+    )
+
     // =====================================================================
     // Contract: start
     // =====================================================================
@@ -192,6 +217,9 @@ class ServerManager(
         val instance = instances.get(instanceId)
             ?: return StartResult.Rejected("Server instance not found. It may have been deleted.")
         val appSettings = settings.current()
+        // A previous session must never leave the Bedrock bridge bound.
+        runCatching { bedrockRelay?.stop() }
+        bedrockRelay = null
 
         // 1. Java runtime.
         val javaHome = jre.javaHome(instance.jreMajor)
@@ -265,6 +293,10 @@ class ServerManager(
         // other device gets "connection refused". Clear it before launch.
         normalizeMinecraftBindAddress(instance)
 
+        // 3c. Bedrock Edition bridge (Geyser): moves Geyser to UDP 19133 and
+        // injects the environment override before the JVM starts.
+        val bedrockPlan = prepareBedrockBridge(instance)
+
         // 4. Memory.
         val memoryMb = LaunchPlanBuilder.resolvedMemoryMb(
             instance,
@@ -312,6 +344,7 @@ class ServerManager(
             builder.directory(plan.workingDir)
             builder.redirectErrorStream(true)
             builder.environment().putAll(plan.environment)
+            if (bedrockPlan.requested) builder.environment().putAll(bedrockPlan.environment)
             builder.start()
         } catch (t: Throwable) {
             runCatching { logTail.close() }
@@ -335,6 +368,12 @@ class ServerManager(
         )
         session = activeSession
         activeSession.serverPort = instance.serverPort
+        activeSession.bedrockPlan = bedrockPlan
+        activeSession.bedrockStatus = BedrockLanStatus(
+            geyserDetected = bedrockPlan.geyserDetected,
+            bridgeRequested = bedrockPlan.requested,
+            relayPort = if (bedrockPlan.requested) BEDROCK_RELAY_PORT else null
+        )
         consoleLimit = appSettings.consoleLogLimit.coerceIn(MIN_CONSOLE_LIMIT, MAX_CONSOLE_LIMIT)
         synchronized(consoleLock) {
             while (consoleBuffer.size > consoleLimit) consoleBuffer.removeFirst()
@@ -521,6 +560,7 @@ class ServerManager(
         scope.launch {
             try {
                 runCatching { refreshLan(current, probe = true, forceReport = true) }
+                if (current.bedrockRelayStarted) runCatching { refreshBedrock(current) }
             } finally {
                 lanProbeInFlight.set(false)
             }
@@ -542,6 +582,7 @@ class ServerManager(
         current.forceRequested = true
         current.stopInitiated.set(true)
         stopLanAnnouncement(current)
+        stopBedrockBridge(current)
         forceKill(current)
         val exited = runCatching { current.process.waitFor(2, TimeUnit.SECONDS) }.getOrDefault(false)
         val code = if (exited) runCatching { current.process.exitValue() }.getOrDefault(-1) else -1
@@ -580,6 +621,7 @@ class ServerManager(
             current.stopRequested = true
             current.forceRequested = true
             stopLanAnnouncement(current)
+            stopBedrockBridge(current)
             // Prevent waitLoop from running the normal post-mortem path; this is
             // an app shutdown, not a server crash.
             current.finalized.set(true)
@@ -920,6 +962,19 @@ class ServerManager(
                 runCatching { refreshLan(session, probe = false) }
                 runCatching { reconcileLanAnnouncement(session) }
             }
+            if (session.isMinecraft && session.bedrockPlan.requested) {
+                val started = session.bedrockRelayStarted
+                if (!started &&
+                    (session.ready || now - session.startedAt >= STARTING_FALLBACK_RUNNING_MS) &&
+                    now - session.bedrockLastAttemptAt >= BEDROCK_START_RETRY_MS
+                ) {
+                    session.bedrockLastAttemptAt = now
+                    runCatching { startBedrockBridge(session) }
+                } else if (started && now - session.bedrockLastRefreshAt >= BEDROCK_STATUS_INTERVAL_MS) {
+                    session.bedrockLastRefreshAt = now
+                    runCatching { refreshBedrock(session) }
+                }
+            }
             delay(STATS_INTERVAL_MS)
         }
     }
@@ -1109,13 +1164,32 @@ class ServerManager(
             paths.pluginsDir(instance.id).listFiles { f ->
                 f.isFile && f.extension.equals("jar", true) && f.name.contains("geyser", true)
             }?.isNotEmpty() == true
+        }.getOrDefault(false) || runCatching {
+            paths.modsDir(instance.id).listFiles { f ->
+                f.isFile && f.extension.equals("jar", true) && f.name.contains("geyser", true)
+            }?.isNotEmpty() == true
         }.getOrDefault(false)
-        if (hasGeyser) {
-            emitConsole(
+        val firstAddress = endpoints.firstOrNull()?.address ?: "<phone-ip>"
+        val bedrockBridgeOn = settings.current().bedrockLanDiscovery
+        when {
+            hasGeyser && bedrockBridgeOn -> emitConsole(
                 LogLevel.INFO,
-                "Geyser/Bedrock: connect Bedrock clients to ${endpoints.firstOrNull()?.address ?: "<phone-ip>"}:19132 (UDP). " +
-                    "For Bedrock, install Floodgate for Paper from geysermc.org (Modrinth's Floodgate " +
-                    "is Fabric/NeoForge only) and restart."
+                "Bedrock Edition: JavaHost's Bedrock LAN bridge listens on UDP $BEDROCK_RELAY_PORT " +
+                    "(Geyser is moved to UDP $BEDROCK_GEYSER_PORT). Once the server is ready, Bedrock " +
+                    "clients on the same Wi-Fi/hotspot should see it in LAN/Friends. Manual fallback: " +
+                    "Add Server $firstAddress:$BEDROCK_RELAY_PORT."
+            )
+            hasGeyser -> emitConsole(
+                LogLevel.INFO,
+                "Bedrock Edition: the Bedrock LAN bridge is disabled in Settings. Geyser listens on " +
+                    "UDP 19132; Bedrock clients can add the server manually with " +
+                    "$firstAddress:19132 (LAN/Friends discovery may not list it)."
+            )
+            instance.flavor == ServerFlavor.PAPER || instance.flavor == ServerFlavor.BUKKIT -> emitConsole(
+                LogLevel.INFO,
+                "Bedrock Edition: install Geyser + Floodgate in plugins/ to let Bedrock clients join " +
+                    "this Paper/Spigot server. JavaHost then bridges Bedrock LAN discovery on UDP " +
+                    "$BEDROCK_RELAY_PORT."
             )
         }
     }
@@ -1183,7 +1257,8 @@ class ServerManager(
             announcementEnabled = announcementEnabled,
             probes = probes,
             warning = warning,
-            summary = buildLanSummary(instance, endpoints, port, announcementEnabled, session.ready)
+            summary = buildLanSummary(instance, endpoints, port, announcementEnabled, session.ready),
+            bedrock = currentBedrockStatus(session)
         )
         session.lanRefreshAt = System.currentTimeMillis()
         val stillCurrent = synchronized(lock) { this.session } === session
@@ -1463,6 +1538,410 @@ class ServerManager(
             }
     }
 
+    // =====================================================================
+    // Bedrock Edition bridge (Geyser 19133 -> app 19132)
+    // =====================================================================
+
+    /**
+     * Decides whether the Bedrock bridge applies to [instance] and prepares
+     * Geyser beforehand:
+     *
+     *  - Geyser is detected from `plugins/` (or `mods/`) and/or its config;
+     *  - when enabled, Geyser's UDP port is moved to [BEDROCK_GEYSER_PORT] in
+     *    `plugins/Geyser-<version>/config.yml` (the original value is remembered in a
+     *    sidecar so disabling the bridge restores it) and the child JVM receives
+     *    `GEYSER_BEDROCK_PORT`/`GEYSER_BEDROCK_ADDRESS` environment overrides
+     *    (Geyser >= 2.12 reads `GEYSER_<PATH>` overrides without touching config);
+     *  - when disabled, a previously patched port is restored.
+     *
+     * Never throws: a failed patch only produces a console warning and the bridge
+     * may still work through the environment override.
+     */
+    private fun prepareBedrockBridge(instance: ServerInstance): BedrockBridgePlan {
+        if (!instance.isMinecraft) {
+            return BedrockBridgePlan(false, false, null, emptyMap())
+        }
+        val pluginsDir = paths.pluginsDir(instance.id)
+        val geyserConfig = runCatching { BedrockGeyserConfig.findConfigFile(pluginsDir) }.getOrNull()
+        val geyserJar = findPluginJar(pluginsDir, "geyser")
+            ?: findPluginJar(paths.modsDir(instance.id), "geyser")
+        val geyserDetected = geyserConfig != null || geyserJar != null
+        val bridgeWanted = settings.current().bedrockLanDiscovery && geyserDetected
+        val sidecar = bedrockSidecarFile(instance)
+
+        if (!bridgeWanted) {
+            restoreBedrockPort(geyserConfig, sidecar)
+            return BedrockBridgePlan(false, geyserDetected, geyserConfig, emptyMap())
+        }
+
+        if (geyserConfig == null) {
+            emitConsole(
+                LogLevel.INFO,
+                "Bedrock bridge: Geyser has not generated its config yet. JavaHost passes " +
+                    "GEYSER_BEDROCK_PORT=$BEDROCK_GEYSER_PORT to Geyser; if Bedrock LAN discovery does " +
+                    "not work, restart the server once more so JavaHost can also update " +
+                    "plugins/Geyser-Spigot/config.yml."
+            )
+        } else {
+            val current = runCatching { BedrockGeyserConfig.readBedrockPort(geyserConfig) }.getOrNull()
+            when {
+                current == null -> emitConsole(
+                    LogLevel.WARN,
+                    "Bedrock bridge: could not find bedrock.port in " +
+                        "${BedrockGeyserConfig.describe(geyserConfig)}. JavaHost passes " +
+                        "GEYSER_BEDROCK_PORT=$BEDROCK_GEYSER_PORT (Geyser 2.12+); if Bedrock clients " +
+                        "cannot join, set bedrock.port: $BEDROCK_GEYSER_PORT manually and restart."
+                )
+                current != BEDROCK_GEYSER_PORT -> {
+                    val outcome = runCatching {
+                        BedrockGeyserConfig.prepareForBridge(
+                            geyserConfig,
+                            BEDROCK_GEYSER_PORT,
+                            BEDROCK_GEYSER_WEBRTC_PORT
+                        )
+                    }.getOrNull()
+                    if (outcome?.changed == true) {
+                        outcome.originalPort?.let { writeSidecarPort(sidecar, it) }
+                        val transportNote = if (outcome.transportPatched) {
+                            " and set transport to \"$BEDROCK_GEYSER_TRANSPORT\" (Geyser 2.12.1 defaults to NetherNet, " +
+                                "which disables the RakNet listener the bridge needs)"
+                        } else {
+                            ""
+                        }
+                        val webrtcNote = if (outcome.webrtcPortPatched) {
+                            " (NetherNet WebRTC UDP moved to $BEDROCK_GEYSER_WEBRTC_PORT)"
+                        } else {
+                            ""
+                        }
+                        emitConsole(
+                            LogLevel.INFO,
+                            "Bedrock bridge: moved Geyser from UDP $current to UDP $BEDROCK_GEYSER_PORT$transportNote" +
+                                "$webrtcNote in ${BedrockGeyserConfig.describe(geyserConfig)} so JavaHost can " +
+                                "answer Bedrock LAN pings on UDP $BEDROCK_RELAY_PORT. Disable the Bedrock LAN " +
+                                "bridge (Settings) to restore the old UDP port; the original value is saved."
+                        )
+                    } else {
+                        emitConsole(
+                            LogLevel.WARN,
+                            "Bedrock bridge: could not update Geyser's UDP port/transport in " +
+                                "${BedrockGeyserConfig.describe(geyserConfig)} " +
+                                "(${outcome?.message ?: "unknown error"}). JavaHost passes " +
+                                "GEYSER_BEDROCK_PORT=$BEDROCK_GEYSER_PORT, " +
+                                "GEYSER_BEDROCK_TRANSPORT=$BEDROCK_GEYSER_TRANSPORT and " +
+                                "GEYSER_BEDROCK_WEBRTC_PORT=$BEDROCK_GEYSER_WEBRTC_PORT; with Geyser older " +
+                                "than 2.12 set bedrock.port: $BEDROCK_GEYSER_PORT manually and restart."
+                        )
+                    }
+                }
+                else -> {
+                    // Already on the bridge port. Still make sure the RakNet
+                    // transport exists (Geyser 2.12.1 defaults to NetherNet) and
+                    // that NetherNet has its own UDP port.
+                    val outcome = runCatching {
+                        BedrockGeyserConfig.prepareForBridge(
+                            geyserConfig,
+                            BEDROCK_GEYSER_PORT,
+                            BEDROCK_GEYSER_WEBRTC_PORT
+                        )
+                    }.getOrNull()
+                    if (outcome != null && (outcome.transportPatched || outcome.webrtcPortPatched)) {
+                        emitConsole(
+                            LogLevel.INFO,
+                            "Bedrock bridge: updated " +
+                                "${BedrockGeyserConfig.describe(geyserConfig)} to transport " +
+                                "$BEDROCK_GEYSER_TRANSPORT and/or webrtc-port $BEDROCK_GEYSER_WEBRTC_PORT " +
+                                "so RakNet stays available for Bedrock LAN discovery."
+                        )
+                    }
+                }
+            }
+        }
+
+        emitConsole(
+            LogLevel.INFO,
+            "Bedrock bridge: Bedrock clients connect to UDP $BEDROCK_RELAY_PORT; Geyser is reached " +
+                "internally on UDP $BEDROCK_GEYSER_PORT."
+        )
+        return BedrockBridgePlan(
+            requested = true,
+            geyserDetected = true,
+            geyserConfig = geyserConfig,
+            environment = mapOf(
+                "GEYSER_BEDROCK_PORT" to BEDROCK_GEYSER_PORT.toString(),
+                "GEYSER_BEDROCK_ADDRESS" to "0.0.0.0",
+                "GEYSER_BEDROCK_TRANSPORT" to BEDROCK_GEYSER_TRANSPORT,
+                "GEYSER_BEDROCK_WEBRTC_PORT" to BEDROCK_GEYSER_WEBRTC_PORT.toString()
+            )
+        )
+    }
+
+    /** First JAR in [dir] whose file name contains [needle] (case-insensitive). */
+    private fun findPluginJar(dir: File, needle: String): File? = runCatching {
+        dir.listFiles { file ->
+            file.isFile && file.extension.equals("jar", true) &&
+                file.name.lowercase(Locale.US).contains(needle)
+        }?.firstOrNull()
+    }.getOrNull()
+
+    private fun bedrockSidecarFile(instance: ServerInstance): File =
+        File(paths.workingDir(instance.id), BEDROCK_SIDECAR_NAME)
+
+    private fun readSidecarPort(file: File): Int? =
+        runCatching { file.readText().trim().toIntOrNull() }.getOrNull()
+
+    private fun writeSidecarPort(file: File, port: Int) {
+        runCatching { file.writeText("$port\n") }
+    }
+
+    /**
+     * Restores a Geyser port this app previously moved, when the bridge is now
+     * off. Only restores when the file still holds [BEDROCK_GEYSER_PORT] so a
+     * user's later manual change is never overwritten.
+     */
+    private fun restoreBedrockPort(geyserConfig: File?, sidecar: File) {
+        if (!sidecar.isFile) return
+        val original = readSidecarPort(sidecar)
+        if (original != null && geyserConfig != null) {
+            val restored = runCatching {
+                BedrockGeyserConfig.restorePort(geyserConfig, BEDROCK_GEYSER_PORT, original)
+            }.getOrDefault(false)
+            if (restored) {
+                emitConsole(
+                    LogLevel.INFO,
+                    "Bedrock bridge is off: restored Geyser's UDP port to $original in " +
+                        "${BedrockGeyserConfig.describe(geyserConfig)}."
+                )
+            }
+        }
+        runCatching { sidecar.delete() }
+    }
+
+    /**
+     * Binds UDP 19132 and starts relaying to Geyser on 19133. Called from the
+     * stats loop once the server is ready (so Geyser has already bound its port,
+     * which avoids a bind race on the very first run after enabling the bridge).
+     */
+    private fun startBedrockBridge(session: Session) {
+        if (!session.bedrockPlan.requested || session.bedrockRelayStarted) return
+        if (session.finalized.get() || synchronized(lock) { this.session } !== session) return
+        session.bedrockLastAttemptAt = System.currentTimeMillis()
+        val relay = BedrockLanRelay(
+            listenPort = BEDROCK_RELAY_PORT,
+            upstreamHost = BEDROCK_UPSTREAM_HOST,
+            upstreamPort = BEDROCK_GEYSER_PORT,
+            // Reply-only (Phantom-style): unsolicited pong broadcasts are untested
+            // against real clients and can confuse the LAN list.
+            beaconIntervalMs = 0L,
+            broadcastProvider = { bedrockBroadcastTargets() },
+            onError = { message -> emitConsole(LogLevel.DEBUG, "Bedrock bridge: $message") }
+        )
+        val started = runCatching { relay.start() }.getOrDefault(false)
+        if (!started) {
+            val address = bedrockEndpoints().firstOrNull()?.hostPort
+                ?: "<phone-ip>:$BEDROCK_RELAY_PORT"
+            val warning = "The Bedrock LAN bridge could not bind UDP $BEDROCK_RELAY_PORT. Another app " +
+                "may already use that port, or Geyser is still listening on $BEDROCK_RELAY_PORT " +
+                "(JavaHost could not move it to $BEDROCK_GEYSER_PORT). Bedrock clients can still join " +
+                "manually at $address if Geyser is reachable."
+            session.bedrockStatus = session.bedrockStatus.copy(
+                relayRunning = false,
+                geyserReachable = false,
+                endpoints = bedrockEndpoints(),
+                directEndpoints = bedrockDirectEndpoints(),
+                warning = warning
+            )
+            // One warning per session: a 2 s retry loop must not flood the console.
+            if (!session.bedrockBindWarningEmitted) {
+                session.bedrockBindWarningEmitted = true
+                emitConsole(LogLevel.WARN, "Bedrock bridge: $warning")
+            }
+            publishBedrockStatus(session)
+            return
+        }
+        // A late successful bind must not become a ghost relay if the session was
+        // stopped/finished while start() was running (mirrors the LAN announcer fix).
+        if (session.finalized.get() || synchronized(lock) { this.session } !== session) {
+            runCatching { relay.stop() }
+            return
+        }
+        bedrockRelay = relay
+        session.bedrockRelayStarted = true
+        session.bedrockBindWarningEmitted = false
+        session.bedrockStartedAt = System.currentTimeMillis()
+        session.bedrockStatus = session.bedrockStatus.copy(
+            relayRunning = true,
+            relayPort = BEDROCK_RELAY_PORT,
+            warning = null
+        )
+        emitConsole(
+            LogLevel.INFO,
+            "Bedrock LAN bridge: listening on UDP $BEDROCK_RELAY_PORT and forwarding to Geyser on " +
+                "UDP $BEDROCK_GEYSER_PORT. Waiting for Geyser to answer the Bedrock ping…"
+        )
+        publishBedrockStatus(session)
+    }
+
+    private fun stopBedrockBridge(session: Session) {
+        session.bedrockRelayStarted = false
+        session.bedrockStatus = session.bedrockStatus.copy(
+            relayRunning = false,
+            geyserReachable = false,
+            endpoints = emptyList()
+        )
+        runCatching { bedrockRelay?.stop() }
+        bedrockRelay = null
+    }
+
+    private fun publishBedrockStatus(session: Session) {
+        _runtime.update { status ->
+            if (status.instanceId == session.instanceId && isActiveState(status.state)) {
+                status.copy(lan = status.lan.copy(bedrock = currentBedrockStatus(session)))
+            } else {
+                status
+            }
+        }
+    }
+
+    /**
+     * Pings Geyser directly to get live Bedrock server info (MOTD, version,
+     * players) and to know whether the bridge can work at all.
+     */
+    private suspend fun refreshBedrock(session: Session) {
+        if (!session.bedrockRelayStarted || session.finalized.get()) return
+        val info = withContext(Dispatchers.IO) { queryBedrockServer(BEDROCK_GEYSER_PORT) }
+        val now = System.currentTimeMillis()
+        // Keep the bridge address visible even while Geyser is unreachable: it is
+        // the documented manual fallback.
+        val endpoints = bedrockEndpoints()
+        if (info != null) {
+            session.bedrockWarningEmitted = false
+            if (!session.bedrockReadyEmitted) {
+                session.bedrockReadyEmitted = true
+                val address = endpoints.firstOrNull()?.hostPort ?: "<phone-ip>:$BEDROCK_RELAY_PORT"
+                val direct = bedrockDirectEndpoints().firstOrNull()?.hostPort
+                emitConsole(
+                    LogLevel.INFO,
+                    "Bedrock LAN bridge ready: Bedrock clients on the same Wi-Fi should see the server " +
+                        "in LAN/Friends within a few seconds. Manual Add Server for the LAN bridge: " +
+                        "$address." + (direct?.let {
+                            " Newer Bedrock versions that switched to NetherNet may need the Geyser " +
+                                "direct address instead: Add Server $it."
+                        } ?: "") + " Geyser ${info.version} · ${info.players}/${info.maxPlayers} " +
+                        "players · MOTD \"${info.motd}\"."
+                )
+            }
+        } else if (now - session.bedrockStartedAt >= BEDROCK_WARN_AFTER_MS && !session.bedrockWarningEmitted) {
+            session.bedrockWarningEmitted = true
+            emitConsole(
+                LogLevel.WARN,
+                "Bedrock bridge: waiting on UDP $BEDROCK_RELAY_PORT but Geyser is not answering RakNet " +
+                    "on UDP $BEDROCK_GEYSER_PORT. Geyser 2.12.1 defaults to the NetherNet transport; " +
+                    "JavaHost sets transport: $BEDROCK_GEYSER_TRANSPORT and webrtc-port " +
+                    "$BEDROCK_GEYSER_WEBRTC_PORT, so check plugins/Geyser-Spigot/config.yml and the " +
+                    "console for Geyser bind/config errors (also make sure Floodgate is installed). " +
+                    "Newer Bedrock clients can still join directly with Add Server <phone-ip>:" +
+                    "$BEDROCK_GEYSER_PORT."
+            )
+        }
+        session.bedrockStatus = BedrockLanStatus(
+            geyserDetected = true,
+            bridgeRequested = true,
+            relayRunning = true,
+            relayPort = BEDROCK_RELAY_PORT,
+            geyserReachable = info != null,
+            motd = info?.motd,
+            version = info?.version,
+            protocol = info?.protocol,
+            players = info?.let { "${it.players}/${it.maxPlayers}" },
+            endpoints = endpoints,
+            directEndpoints = bedrockDirectEndpoints(),
+            // Bind failures keep their warning from startBedrockBridge(); the
+            // "Geyser not answering" case is shown by the UI's status line and
+            // logged to the console once, so do not duplicate it here.
+            warning = null
+        )
+        publishBedrockStatus(session)
+    }
+
+    /** One RakNet ping round-trip to the local Geyser listener; null when it does not answer. */
+    private fun queryBedrockServer(port: Int): BedrockRakNet.ServerInfo? {
+        val socket = DatagramSocket()
+        return try {
+            socket.soTimeout = BEDROCK_QUERY_TIMEOUT_MS
+            val ping = BedrockRakNet.buildPing(System.currentTimeMillis(), bedrockClientGuid)
+            val target = InetAddress.getByName(BEDROCK_UPSTREAM_HOST)
+            socket.send(DatagramPacket(ping, ping.size, target, port))
+            val buffer = ByteArray(BEDROCK_PONG_BUFFER)
+            val packet = DatagramPacket(buffer, buffer.size)
+            socket.receive(packet)
+            val pong = BedrockRakNet.parsePong(buffer.copyOf(packet.length)) ?: return null
+            BedrockRakNet.parseServerId(pong.serverId)
+        } catch (t: Throwable) {
+            null
+        } finally {
+            runCatching { socket.close() }
+        }
+    }
+
+    private fun bedrockEndpoints(): List<LanEndpointInfo> {
+        val endpoints = runCatching { lanInfo.endpoints() }.getOrDefault(emptyList())
+        return endpoints.map { endpoint ->
+            LanEndpointInfo(
+                address = endpoint.address,
+                interfaceName = endpoint.interfaceName,
+                label = endpoint.label,
+                hostPort = "${endpoint.address}:$BEDROCK_RELAY_PORT"
+            )
+        }
+    }
+
+    /**
+     * Geyser's own address for Bedrock clients that use the NetherNet transport
+     * (Bedrock >= 26.60) and therefore cannot join through the RakNet bridge:
+     * use Add Server with `<phone-ip>:19133`.
+     */
+    private fun bedrockDirectEndpoints(): List<LanEndpointInfo> {
+        val endpoints = runCatching { lanInfo.endpoints() }.getOrDefault(emptyList())
+        return endpoints.map { endpoint ->
+            LanEndpointInfo(
+                address = endpoint.address,
+                interfaceName = endpoint.interfaceName,
+                label = endpoint.label,
+                hostPort = "${endpoint.address}:$BEDROCK_GEYSER_PORT"
+            )
+        }
+    }
+
+    /** Broadcast targets for the Bedrock pong beacon: limited + per-interface subnet broadcasts. */
+    private fun bedrockBroadcastTargets(): List<String> {
+        val targets = linkedSetOf<String>()
+        targets.add(BEDROCK_LIMITED_BROADCAST)
+        runCatching {
+            for (endpoint in lanInfo.endpoints()) {
+                val broadcast = LanAddressSelector.subnetBroadcast(endpoint.address, endpoint.prefixLength)
+                if (broadcast != null && broadcast != endpoint.address) targets.add(broadcast)
+            }
+        }
+        return targets.toList()
+    }
+
+    private fun currentBedrockStatus(session: Session): BedrockLanStatus {
+        val plan = session.bedrockPlan
+        return if (plan.requested) {
+            session.bedrockStatus.copy(
+                geyserDetected = true,
+                bridgeRequested = true,
+                relayPort = BEDROCK_RELAY_PORT,
+                directEndpoints = bedrockDirectEndpoints()
+            )
+        } else {
+            BedrockLanStatus(
+                geyserDetected = plan.geyserDetected,
+                bridgeRequested = false
+            )
+        }
+    }
+
     private suspend fun stopSession(session: Session, force: Boolean) {
         if (!session.stopInitiated.compareAndSet(false, true)) {
             withTimeoutOrNull(GRACEFUL_STOP_MAX_MS + 10_000L) { session.finished.await() }
@@ -1472,6 +1951,7 @@ class ServerManager(
         session.stopRequested = true
         if (force) session.forceRequested = true
         stopLanAnnouncement(session)
+        stopBedrockBridge(session)
 
         val alive = isProcessAlive(session.process)
         if (alive) {
@@ -1559,6 +2039,7 @@ class ServerManager(
     private fun finishSession(session: Session, exitCode: Int) {
         if (!session.finalized.compareAndSet(false, true)) return
         stopLanAnnouncement(session)
+        stopBedrockBridge(session)
         session.statsJob?.cancel()
         val now = System.currentTimeMillis()
         val duration = (now - session.startedAt).coerceAtLeast(0L)
@@ -1780,6 +2261,16 @@ class ServerManager(
         @Volatile var announcerRunning = false
         @Volatile var announcedInterface: String? = null
         @Volatile var lastAnnounceAttemptAt = 0L
+        @Volatile var bedrockPlan: BedrockBridgePlan =
+            BedrockBridgePlan(false, false, null, emptyMap())
+        @Volatile var bedrockStatus: BedrockLanStatus = BedrockLanStatus()
+        @Volatile var bedrockRelayStarted = false
+        @Volatile var bedrockStartedAt = 0L
+        @Volatile var bedrockLastRefreshAt = 0L
+        @Volatile var bedrockLastAttemptAt = 0L
+        @Volatile var bedrockBindWarningEmitted = false
+        @Volatile var bedrockWarningEmitted = false
+        @Volatile var bedrockReadyEmitted = false
 
         fun pushTail(line: String) {
             synchronized(tailLock) {
@@ -1805,6 +2296,18 @@ class ServerManager(
         const val CONSOLE_PUBLISH_INTERVAL_MS = 100L
         const val MAX_CONSOLE_LINE_CHARS = 8_000
         const val LAN_REFRESH_INTERVAL_MS = 10_000L
+        const val BEDROCK_RELAY_PORT = 19132
+        const val BEDROCK_GEYSER_PORT = 19133
+        const val BEDROCK_GEYSER_WEBRTC_PORT = 19134
+        const val BEDROCK_GEYSER_TRANSPORT = "both"
+        const val BEDROCK_UPSTREAM_HOST = "127.0.0.1"
+        const val BEDROCK_LIMITED_BROADCAST = "255.255.255.255"
+        const val BEDROCK_STATUS_INTERVAL_MS = 5_000L
+        const val BEDROCK_START_RETRY_MS = 30_000L
+        const val BEDROCK_WARN_AFTER_MS = 60_000L
+        const val BEDROCK_QUERY_TIMEOUT_MS = 800
+        const val BEDROCK_PONG_BUFFER = 2048
+        const val BEDROCK_SIDECAR_NAME = ".javahost-geyser-bedrock-port"
         const val LAN_READY_SETTLE_MS = 750L
         const val LAN_PROBE_TIMEOUT_MS = 2_500
         const val ANNOUNCE_RETRY_MS = 30_000L

@@ -124,6 +124,12 @@ data class AppSettings(
     val consoleLogLimit: Int = 5000,
     /** Announce a running Minecraft server on the LAN (multicast discovery). */
     val minecraftLanDiscovery: Boolean = true,
+    /**
+     * Bedrock Edition: run the app-side LAN bridge (UDP 19132) and move Geyser to
+     * 19133 so Bedrock clients see the server in LAN/Friends. Applies on the next
+     * server start because Geyser's port is fixed at process launch.
+     */
+    val bedrockLanDiscovery: Boolean = true,
     val autoRestartOnCrash: Boolean = false,
     val notificationsRequested: Boolean = false,
     val firstServerAdded: Boolean = false,
@@ -179,6 +185,41 @@ data class LanProbeInfo(
 )
 
 /**
+ * Bedrock Edition (Geyser) LAN bridge state.
+ *
+ * Bedrock clients discover LAN servers by broadcasting a RakNet unconnected ping
+ * to UDP 19132; JavaHost's bridge answers it and relays gameplay to Geyser on
+ * UDP 19133, so the client's "LAN/Friends" list can show the server.
+ */
+data class BedrockLanStatus(
+    /** A Geyser plugin JAR was found in plugins/. */
+    val geyserDetected: Boolean = false,
+    /** The user wants the bridge and it is applicable (Minecraft + Geyser). */
+    val bridgeRequested: Boolean = false,
+    /** The UDP 19132 relay actually bound and is relaying. */
+    val relayRunning: Boolean = false,
+    /** Port Bedrock clients must use (normally 19132). */
+    val relayPort: Int? = null,
+    /** Geyser answered a RakNet ping on its internal port (normally 19133). */
+    val geyserReachable: Boolean = false,
+    val motd: String? = null,
+    val version: String? = null,
+    val protocol: Int? = null,
+    /** "3/10" when known. */
+    val players: String? = null,
+    /** Bedrock addresses clients can use through the LAN bridge (UDP 19132), one per LAN interface. */
+    val endpoints: List<LanEndpointInfo> = emptyList(),
+    /**
+     * Geyser's own addresses (`<ip>:19133`) for Bedrock clients that switched to
+     * the NetherNet transport and cannot join through the RakNet LAN bridge; use
+     * Add Server with one of these as the fallback.
+     */
+    val directEndpoints: List<LanEndpointInfo> = emptyList(),
+    /** Actionable problem (relay could not bind, Geyser not reachable, ...). */
+    val warning: String? = null
+)
+
+/**
  * Everything the UI needs to describe how other devices can reach the server:
  * the usable LAN addresses, the port, the phone's connectivity state, the
  * reachability self-test and the one-line warnings/help text.
@@ -196,7 +237,9 @@ data class LanStatus(
     /** Blocking problem the user must fix (no LAN address, VPN, loopback bind). */
     val warning: String? = null,
     /** Short actionable line ("Add server 192.168.1.50:25565 in Minecraft"). */
-    val summary: String? = null
+    val summary: String? = null,
+    /** Bedrock Edition bridge state (Geyser). */
+    val bedrock: BedrockLanStatus = BedrockLanStatus()
 ) {
     val hasEndpoint: Boolean get() = endpoints.isNotEmpty()
 }

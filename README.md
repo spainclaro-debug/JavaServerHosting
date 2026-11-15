@@ -9,13 +9,13 @@ Built with Kotlin + Jetpack Compose. Target: **arm64-v8a, Android 8.0+ (API 26),
 no root**. The APK is intended for GitHub/F-Droid-style sideloading; see
 [Why targetSdk 28](docs/ARCHITECTURE.md#why-the-app-targets-api-28).
 
-> **Status:** functional MVP, buildable and tested. **327 hermetic unit tests
+> **Status:** functional MVP, buildable and tested. **419 hermetic unit tests
 > (0 failures, 3 environment-gated skips)**; debug and signed release APKs
-> are built. The current release is **1.2.0** (versionCode 9, LAN hosting &
-> discovery); see [CHANGELOG.md](CHANGELOG.md). Minecraft (Vanilla 1.20.4, Paper
-> 1.20.4, Fabric 1.20.4), a generic Java server (WireMock) and a purpose-built
-> sample HTTP server were booted on an Android/bionic OpenJDK 21 during
-> development.
+> are built. The current release is **1.3.0** (versionCode 10, Java Edition LAN +
+> Bedrock Edition LAN via Geyser); see [CHANGELOG.md](CHANGELOG.md). Minecraft
+> (Vanilla 1.20.4, Paper 1.20.4, Fabric 1.20.4), a generic Java server (WireMock)
+> and a purpose-built sample HTTP server were booted on an Android/bionic
+> OpenJDK 21 during development.
 > On-device foreground-service/Doze behaviour is covered by design and a manual
 > checklist but was **not** executed in this build environment (no
 > device/emulator). See [docs/TESTING.md](docs/TESTING.md).
@@ -80,6 +80,9 @@ no root**. The APK is intended for GitHub/F-Droid-style sideloading; see
   `eula.txt` and blocks start until accepted.
 - Player count parsed from server output and shown in the notification/UI.
 - Server readiness detection and crash diagnostics.
+- **Bedrock Edition clients** through Geyser-Spigot + Floodgate and the app's
+  Bedrock LAN bridge (see LAN features below); Java and Bedrock can both be
+  hosted and discovered at the same time.
 
 ### LAN hosting & discovery (1.2.0)
 - **Correct LAN address resolution:** only Wi-Fi, ethernet and hotspot
@@ -104,7 +107,41 @@ no root**. The APK is intended for GitHub/F-Droid-style sideloading; see
 - Caveats that no app can fix: clients must be on the **same Wi-Fi/hotspot**, and
   router AP/client isolation or guest networks block LAN traffic. Dedicated-server
   discovery is best-effort (some clients/versions do not scan); Bedrock clients
-  still need Geyser/Floodgate. See [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md).
+  need Geyser/Floodgate and the Bedrock bridge below. See
+  [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md).
+
+### Bedrock Edition LAN (Geyser, 1.3.0)
+- **RakNet-era Bedrock clients see the server in LAN/Friends** again, not only
+  through manual Add Server. While a Minecraft server with **Geyser-Spigot +
+  Floodgate** runs, JavaHost's Phantom-style bridge binds UDP `19132`, answers
+  Bedrock's RakNet LAN pings with a correct Unconnected Pong, and relays gameplay
+  datagrams to Geyser. The LAN card's **Bedrock Edition** block shows the bridge
+  address `<phone-ip>:19132`, Geyser's direct address `<phone-ip>:19133`, the
+  Geyser version, MOTD and player count, or a warning if Geyser is not reachable
+  yet.
+- **Geyser is moved to UDP 19133** for the bridge. Geyser 2.12.1 removed the
+  RakNet-only transport and defaults to **NetherNet**, so the bridge also sets
+  `bedrock.transport: both` and `bedrock.webrtc-port: 19134` (when those keys
+  exist) and passes `GEYSER_BEDROCK_PORT=19133`,
+  `GEYSER_BEDROCK_TRANSPORT=both`, `GEYSER_BEDROCK_WEBRTC_PORT=19134` and
+  `GEYSER_BEDROCK_ADDRESS=0.0.0.0` to the server JVM. Only the original port is
+  restored when you turn the bridge off; `transport: both` stays so both client
+  generations keep working. **Restart the server** after enabling it.
+- The relay is **reply-only** (Phantom-style): it answers the clients' own LAN
+  pings and relays their traffic to Geyser. Unsolicited pong broadcasts are
+  disabled in 1.3.0 because they are untested against real clients.
+- **Newer clients (Bedrock 26.60+, NetherNet).** Those clients no longer join
+  over RakNet and may not join through the 19132 bridge; use Geyser's direct
+  address **Add Server `<phone-ip>:19133`** from the LAN card. On Android/bionic
+  Geyser's NetherNet native library may not load at all (a plugin-native
+  limitation the console reports). Some 2026 clients also fail to list a valid
+  server pong (Mojang bug **MCPE-239883**) — the manual addresses remain the
+  reliable fallback.
+- **Bedrock LAN bridge (Geyser)** is on by default; change it on the LAN card or
+  in **Settings**. If the LAN list stays empty, try **Add Server**
+  `<phone-ip>:19132`, then `<phone-ip>:19133`. Console Bedrock builds and Windows
+  firewall rules can affect discovery; see
+  [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md).
 
 ### Generic Java path (power user)
 - No Minecraft UI; working-directory file manager, raw JVM args and server args.
@@ -148,12 +185,19 @@ exemption → Phantom Process Killer guidance → optional Minecraft EULA → do
   Plan for **≥ 500 MB free** for a Minecraft server.
 - A server JAR you are allowed to run. JavaHost does not bundle Minecraft server
   software; Mojang's EULA applies to Minecraft servers.
+- **Bedrock Edition hosting:** a Paper/Spigot server with **Geyser-Spigot +
+  Floodgate** installed in `plugins/` (Geyser is available through the Modrinth
+  plugin manager; Floodgate is distributed by GeyserMC and normally has to be
+  imported via Files). Bedrock clients use UDP `19132` through the app's LAN
+  bridge; Geyser's direct port `19133` is the fallback for NetherNet-era clients;
+  Java clients use the Java port (25565 by default). The bridge sets Geyser's
+  `transport: both` (RakNet + NetherNet) automatically.
 
 ## Build
 
 ```bash
 # JDK 17+ and Android SDK 34 required.
-./gradlew :app:testDebugUnitTest   # 327 hermetic tests
+./gradlew :app:testDebugUnitTest   # 419 hermetic tests
 ./gradlew :app:assembleDebug       # app/build/outputs/apk/debug/app-debug.apk
 ./gradlew :app:assembleRelease     # unsigned; sign with apksigner for distribution
 ```
@@ -219,6 +263,17 @@ Unit tests (all hermetic, no network/device):
    prepared; see [docs/POLICY.md](docs/POLICY.md).
 8. **JRE size.** Not in the APK. ~106 MB download from Termux mirrors on first
    use, verified by SHA-256, cached per architecture/major.
+9. **Bedrock LAN discovery is best-effort and needs Geyser.** It requires
+   Geyser-Spigot + Floodgate on a Paper/Spigot server, takes effect at the next
+   server start, covers IPv4 only, and can still be blocked by AP/client
+   isolation, router broadcast filtering or a Windows client firewall. The
+   bridge is the **RakNet** LAN-discovery/relay path: Bedrock 26.60+ clients
+   switched to NetherNet (Geyser's NetherNet transition) and may not join
+   through 19132 — use Geyser's direct address **Add Server**
+   `<phone-ip>:19133`, and note that some 2026 clients fail to list a valid
+   server pong (Mojang bug MCPE-239883). On Android/bionic Geyser's NetherNet
+   native library may not load. Console Bedrock builds vary in what they show;
+   the LAN card's manual addresses are the reliable fallback.
 
 Also: aarch64 only; no root; one child JVM at a time; first Paper boot downloads
 its libraries and can take a while; JNA warnings may still appear on some server
@@ -229,14 +284,16 @@ versions even though the server runs.
 - Stop/restart stuck at “Shutting down…”
 - Plugins (Geyser/Floodgate/ViaVersion) installed but not loading
 - Server does not appear in Minecraft / other devices cannot connect
+- Bedrock clients cannot see or join the server (LAN/Friends)
 - Server visible in Minecraft but join fails
 
 See [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md) for the server-flavor /
-loader matrix, the LAN card and join checklists. JavaHost 1.2.0 adds correct LAN
-address resolution, a TCP reachability self-test and Minecraft LAN discovery;
-JavaHost 1.1.2 also hardens the stop path and prints a per-start diagnostic with
-the server type and plugin/mod counts. v1.2.0 is an **in-place upgrade of
-1.1.6** (same signing key), so settings and instances are kept.
+loader matrix, the LAN card and join checklists. JavaHost 1.3.0 adds the Bedrock
+LAN bridge on top of the 1.2.0 LAN work (correct LAN address resolution, a TCP
+reachability self-test and Minecraft LAN discovery); JavaHost 1.1.2 also hardens
+the stop path and prints a per-start diagnostic with the server type and
+plugin/mod counts. v1.3.0 is an **in-place upgrade of 1.2.0** (same signing key),
+so settings, instances and worlds are kept.
 
 ## Project layout
 
@@ -248,6 +305,7 @@ app/src/main/java/dev/javahost/
   core/runtime/      Termux index/deb extraction, JreManager, permissions
   core/jar/          JarInspector (Android-free)
   core/launch/       ProcessBuilder command building + arg tokenizer
+  core/net/          LAN address selection, discovery announcers, Bedrock bridge
   core/server/       ServerManager, console/log/crash/heap/JNA helpers
   core/service/      ForegroundServerService + notifications
   core/system/       powermanagement, memory advisor, silent media, guides
@@ -259,9 +317,11 @@ tools/               sample generic server + verification scripts
 
 ## Security & privacy
 
-No accounts, telemetry, ads or analytics. Network is used only for the Termux
-JRE download, Modrinth, and user-tapped links. All endpoints HTTPS; cleartext is
-disabled. No root, no all-files access. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+No accounts, telemetry, ads or analytics. Network is used for the Termux
+JRE download, Modrinth, user-tapped links, and local-network hosting/discovery
+(the LAN sockets only advertise/relay on the phone's own network). All
+endpoints HTTPS; cleartext is disabled. No root, no all-files access. See
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Credits & licenses
 

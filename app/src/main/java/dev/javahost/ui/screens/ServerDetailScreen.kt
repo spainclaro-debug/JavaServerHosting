@@ -17,6 +17,7 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -37,6 +38,7 @@ import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import dev.javahost.core.model.BedrockLanStatus
 import dev.javahost.core.model.ExitInfo
 import dev.javahost.core.model.LanEndpointInfo
 import dev.javahost.core.model.LanProbeInfo
@@ -290,6 +292,22 @@ fun ServerDetailScreen(
                             "listens on all interfaces.",
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+
+                    HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.3f))
+                    BedrockLanBlock(
+                        status = runtime.lan.bedrock,
+                        // While the server runs the runtime is authoritative; when it is
+                        // stopped the runtime LAN status is a default, so use the on-disk
+                        // plugin scan from the ViewModel instead.
+                        geyserDetected = if (isThisActive) {
+                            runtime.lan.bedrock.geyserDetected
+                        } else {
+                            state.bedrockDetected[live.id] == true
+                        },
+                        enabled = state.settings.bedrockLanDiscovery,
+                        isActive = isThisActive,
+                        onEnabledChange = actions::setBedrockLanDiscovery
                     )
                 } else {
                     Text(
@@ -661,6 +679,158 @@ private fun LanProbeResultRow(probe: LanProbeInfo) {
                     )
                 }
             }
+        }
+    }
+}
+
+/* -------------------------------------------------------------------------- */
+/* Bedrock Edition (Geyser) LAN bridge pieces                                  */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Bedrock clients discover LAN servers by pinging UDP 19132; the app-side bridge
+ * answers and relays to Geyser, which is moved to UDP 19133. Only rendered for
+ * Minecraft instances; requires Geyser + Floodgate to be installed.
+ *
+ * [geyserDetected] comes from the live runtime while this server is active and from
+ * the ViewModel's on-disk plugin scan when it is stopped, so the install hint is not
+ * shown to users who already have Geyser.
+ */
+@Composable
+private fun BedrockLanBlock(
+    status: BedrockLanStatus,
+    geyserDetected: Boolean,
+    enabled: Boolean,
+    isActive: Boolean,
+    onEnabledChange: (Boolean) -> Unit
+) {
+    Text("Bedrock Edition", style = MaterialTheme.typography.labelLarge)
+    if (!geyserDetected) {
+        Text(
+            "Bedrock clients need Geyser + Floodgate on a Paper server. Install both plugins, then restart.",
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        return
+    }
+
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Column(modifier = Modifier.weight(1f)) {
+            Text("Bedrock LAN bridge (Geyser)", style = MaterialTheme.typography.bodyLarge)
+            Text(
+                "Moves Geyser to UDP 19133 and announces your phone's LAN address on UDP 19132 so " +
+                    "Bedrock clients see the server in LAN/Friends. Also sets Geyser 2.12.1's " +
+                    "transport to both (NetherNet WebRTC on UDP 19134) so RakNet LAN discovery stays " +
+                    "available. Applies after the next server start/restart.",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+        Switch(checked = enabled, onCheckedChange = onEnabledChange)
+    }
+    if (!enabled) return
+
+    if (!isActive) {
+        Text(
+            "Start the server to see the Bedrock LAN address and bridge status.",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        return
+    }
+
+    status.endpoints.forEach { endpoint ->
+        LanEndpointRow(endpoint = endpoint, showUrl = false)
+    }
+    val waitingForGeyser = status.relayRunning && !status.geyserReachable
+    when {
+        !status.relayRunning -> Text(
+            "The Bedrock LAN bridge starts when the server is ready.",
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+
+        status.geyserReachable -> {
+            val joinTarget = status.endpoints.firstOrNull()?.hostPort
+            val details = listOfNotNull(
+                status.version?.takeIf { it.isNotBlank() }?.let { version -> "Geyser $version" },
+                status.players?.takeIf { it.isNotBlank() },
+                status.motd?.takeIf { it.isNotBlank() }?.let { motd -> "\"$motd\"" }
+            ).joinToString(" · ")
+            val line = when {
+                joinTarget != null -> "Bedrock clients can join $joinTarget"
+                status.relayPort != null -> "Bedrock LAN bridge is ready on UDP ${status.relayPort}"
+                else -> "Bedrock LAN bridge is ready"
+            }
+            Text(
+                if (details.isEmpty()) line else "$line ($details)",
+                style = MaterialTheme.typography.bodyMedium,
+                color = TealGreen
+            )
+        }
+
+        else -> Text(
+            "The Bedrock LAN bridge is running, but Geyser did not answer on UDP 19133 (its " +
+                "internal port). Bedrock clients cannot join until Geyser is ready — check the " +
+                "console for Geyser startup errors. Geyser 2.12.1 defaults to NetherNet; JavaHost " +
+                "sets transport to both with WebRTC on UDP 19134, so verify the Geyser config if " +
+                "this persists.",
+            style = MaterialTheme.typography.bodyMedium,
+            color = WarnAmber
+        )
+    }
+    if (status.directEndpoints.isNotEmpty()) {
+        status.directEndpoints.forEach { endpoint -> BedrockDirectRow(endpoint) }
+        Text(
+            "Bedrock 26.60+ / NetherNet clients: if the server does not appear in LAN/Friends, use " +
+                "Add Server with the Geyser direct address above. The bridge implements the RakNet " +
+                "LAN path only.",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+    }
+    // The waiting-for-Geyser line above is the authoritative status for that condition,
+    // so do not repeat a block-level warning that describes the same problem. Bridge/bind
+    // failures imply the relay is not running and still surface here.
+    if (!waitingForGeyser) {
+        status.warning?.let { warning ->
+            Text(
+                warning,
+                style = MaterialTheme.typography.bodyMedium,
+                color = WarnAmber
+            )
+        }
+    }
+}
+
+/**
+ * Geyser's own `<ip>:19133` address. Newer Bedrock clients may use the NetherNet
+ * transport, which cannot join through the RakNet LAN bridge; Add Server with this
+ * address is the honest fallback.
+ */
+@Composable
+private fun BedrockDirectRow(endpoint: LanEndpointInfo) {
+    val clipboard = LocalClipboardManager.current
+    val copyText = endpoint.hostPort ?: endpoint.address
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                "Geyser direct (newer Bedrock clients): $copyText",
+                style = MaterialTheme.typography.bodyMedium
+            )
+            if (endpoint.label.isNotBlank()) {
+                Text(
+                    endpoint.label,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        }
+        TextButton(onClick = { clipboard.setText(AnnotatedString(copyText)) }) {
+            Text("Copy")
         }
     }
 }

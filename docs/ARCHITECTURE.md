@@ -221,7 +221,11 @@ Empty input or everything filtered returns `emptyList()` instead of throwing.
 connectivity state (`ConnectivityManager`: Wi-Fi / ethernet / mobile data / VPN),
 the `MulticastLock`, and the preferred `NetworkInterface` for the announcement
 socket. All Android calls are wrapped so missing permissions or services degrade
-to an empty state rather than a crash.
+to an empty state rather than a crash. `LanInterface`/`LanEndpoint` also carry
+`prefixLength` (from the interface's address, 24 when unavailable);
+`LanAddressSelector.subnetBroadcast(address, prefixLength)` uses it to compute
+each subnet's broadcast address for the Bedrock relay's optional beacon (off in
+1.3.0 — the bridge is reply-only).
 
 ### Reachability self-test (`LanProbe.kt`)
 
@@ -290,6 +294,170 @@ Minecraft announcement if you do not want the server listed; because loopback
 `server-ip` values are normalised away, stopping the server is what ends LAN
 access. The app still does not request root, all-files access or any dangerous
 runtime permission.
+
+## Bedrock LAN bridge
+
+Bedrock Edition discovers LAN worlds with **RakNet**, not the Java multicast
+announcement: the client broadcasts an Unconnected Ping to UDP 19132 and lists a
+server only when it receives an Unconnected Pong whose source address is the
+address it should connect to. A Geyser plugin does not reliably answer that on
+Android, and Geyser itself owns UDP 19132, so JavaHost takes over the LAN-facing
+port (the Phantom-style approach used by projects such as jhead/phantom and
+mcbe-lan-advertizer) and relays traffic to Geyser on 19133.
+
+### Port layout while the bridge runs
+
+| Port | Protocol | Purpose | Owner |
+|---|---|---|---|
+| `19132` | UDP | Bedrock LAN discovery + RakNet client traffic | JavaHost `BedrockLanRelay` |
+| `19133` | UDP/TCP | Geyser's RakNet listener + NetherNet signalling | child JVM (Geyser plugin) |
+| `19134` | UDP | NetherNet/WebRTC media (distinct UDP port, so it does not collide with RakNet) | child JVM (Geyser plugin) |
+| `25565` (or `server-port`) | TCP | Java Edition clients | child JVM (server) |
+| `4445` | UDP multicast | Java Edition LAN announcement | `MinecraftLanAnnouncer` |
+
+Geyser 2.12.1 no longer enables RakNet by default (`bedrock.transport` is
+`both|nethernet`, default `nethernet`), so the bridge sets `transport: both` and
+moves NetherNet's WebRTC port to 19134: the RakNet listener on 19133 is what the
+bridge pings and relays to, while NetherNet keeps working for newer clients.
+
+### RakNet ping/pong format (`BedrockRakNet.kt`)
+
+```
+Unconnected Ping (0x01):      id(1) | time(8, BE) | MAGIC(16) | clientGuid(8)
+Unconnected Ping OC (0x02):   same shape (open-connections variant)
+Unconnected Pong (0x1c):      id(1) | pingTime(8, BE) | serverGuid(8, BE) |
+                              MAGIC(16) | length(2, BE) | serverId(length, UTF-8)
+MAGIC = 00 ff ff 00 fe fe fe fe fd fd fd fd 12 34 56 78
+```
+
+The `serverId` is a semicolon-separated descriptor (it always ends with `;`):
+
+```
+MCPE; <motd>; <protocol>; <version>; <players>; <maxPlayers>; <guid>;
+ 0      1        2           3          4          5            6
+<subMotd>; <gamemode>; <nintendoLimited>; <port4>; <port6>;
+ 7          8            9                  10       11
+```
+
+- Index 0 is always `MCPE`, 1 the MOTD, 2 the Bedrock protocol, 3 the version
+  string, 4/5 player counts, 6 the server GUID as a string, 7 the sub-MOTD,
+  8 the gamemode, 9 the Nintendo-limited flag, 10 the advertised IPv4 port and
+  11 the advertised IPv6 port.
+- Newer Bedrock versions append trailing fields; the parser accepts and keeps
+  them and the rewriter preserves them rather than dropping unknown data.
+- Clients connect to the **pong packet's source IP** plus the descriptor's
+  `port4`, which is why the rewrite and the relay must be sent from the socket
+  bound to 19132.
+
+### Pong rewrite and relay sessions (`BedrockLanRelay.kt`)
+
+The relay binds a single UDP socket on `0.0.0.0:19132` with `SO_BROADCAST` only
+(`SO_REUSEADDR` is deliberately **not** set: if Geyser still owns 19132 the bind
+must fail loudly instead of silently splitting datagrams between two sockets),
+and then:
+
+- **relays client datagrams to Geyser**, including Unconnected Pings, through one
+  connected `DatagramSocket` per client to `127.0.0.1:19133`. The ping bytes are
+  forwarded unchanged so the pong's echoed ping time matches what the client
+  sent;
+- **sends server datagrams back through the listening socket**, so Bedrock sees
+  the answer arriving from 19132 (the address it must connect to). Incoming
+  Unconnected Pongs (0x1c) are rewritten first through
+  `BedrockRakNet.rewritePong`: the advertised port becomes `boundPort` and the
+  descriptor's GUID becomes a per-instance relay GUID.
+- **answers LAN discovery in reply-only mode** (Phantom-style): the clients' own
+  pings get the rewritten pong. The relay also implements an unsolicited pong
+  beacon (`beaconIntervalMs`), but the app disables it in 1.3.0 — broadcasts are
+  untested against real clients and can confuse the LAN list;
+- keeps up to 32 concurrent sessions, closes the oldest first, and reaps sessions
+  idle for 120 s; stats expose clients, packets each way and pings answered. In
+  tests `listenPort = 0` lets the OS assign a free port (`boundPort` exposes it),
+  `start()` returns false with an error when the port is already bound, and
+  `stop()` closes the listener and every session socket.
+
+The upstream side is loopback-only (`127.0.0.1:19133`); only the listening
+socket faces the LAN.
+
+### Geyser port move and transport (`BedrockGeyserConfig.kt`)
+
+Geyser 2.12.1 (current stable) removed the RakNet-only transport:
+`bedrock.transport` is now `both|nethernet` and defaults to **nethernet**, so a
+plain port move would leave Geyser with no RakNet listener and the bridge's ping
+to 19133 would get no answer. Two complementary mechanisms
+are applied when a Minecraft server is about to start with the bridge requested:
+
+1. **Environment overrides:** the child JVM is launched with
+   `GEYSER_BEDROCK_PORT=19133`, `GEYSER_BEDROCK_TRANSPORT=both`,
+   `GEYSER_BEDROCK_WEBRTC_PORT=19134` and `GEYSER_BEDROCK_ADDRESS=0.0.0.0`.
+   Geyser ≥2.12 maps `GEYSER_<CONFIG_PATH>` environment variables onto its
+   config, so those builds need no file edit.
+2. **Config patch fallback:** for builds that ignore the env override, the app
+   locates the first `plugins/*/config.yml` whose directory name contains
+   "geyser" and calls `BedrockGeyserConfig.prepareForBridge(...)`, which sets
+   `bedrock.port` to 19133 and — only when those keys already exist — sets
+   `bedrock.transport` to `both` and `bedrock.webrtc-port` to 19134. The legacy
+   top-level `bedrock-port` is still understood. The rewrite is **in place**,
+   preserving comments, ordering, indentation, CRLF and every other byte, and is
+   written atomically via temp file + rename. `findConfigFile`,
+   `readBedrockPort`, `prepareForBridge` (`BridgePatchOutcome` reports which
+   values changed), `patchToPort`, `restorePort` and `describe` are pure
+   `java.io.File` code and unit-tested; a missing config is tolerated (Geyser
+   regenerates it on first run and the env override covers newer builds).
+
+The sidecar file in the instance working directory (`<instance>/.javahost-geyser-bedrock-port`) records the **original port**. When the
+bridge is disabled, `restorePort` writes it back only if the current value is
+still the patched 19133, so a manual edit is never clobbered. Only the port is
+restored: `transport: both` and `webrtc-port: 19134` stay, because they keep
+RakNet and NetherNet working together for both client generations. On Geyser
+≤2.12.0 (where the `transport`/`webrtc-port` keys do not exist) the patch simply
+leaves those values alone — RakNet was the default there.
+
+### Lifecycle and status
+
+The bridge applies only to Minecraft instances whose `plugins/` contains a
+Geyser JAR, when **Bedrock LAN bridge (Geyser)** is on (default). It is evaluated
+at server start/restart because Geyser's listen port is fixed at JVM launch.
+Once the server is ready, the app starts the relay, pings Geyser over RakNet
+every few seconds, and publishes `BedrockLanStatus` (relay running, bound port,
+Geyser reachable, MOTD/version/protocol/players, per-interface bridge
+endpoints, Geyser **direct** endpoints for NetherNet-era clients, warning)
+through `ServerRuntimeStatus.lan.bedrock`; the LAN card renders both address
+sets. Stopping the server stops the relay and releases its sockets; Geyser's
+original UDP port is restored on the next server start only when the bridge has
+been disabled. Failures stay warnings, never crashes: a busy UDP
+19132, a Geyser that has not bound 19133 yet, or an unwritable config are
+reported on the card while the Java side keeps working.
+
+### NetherNet-era clients and known client bugs
+
+Bedrock clients from **26.60 (October 2026)** no longer join over RakNet and use
+Geyser's NetherNet/WebRTC transport instead. The app cannot provide NetherNet
+**LAN discovery** through the 19132 bridge; it can only keep Geyser's RakNet
+listener alive (`transport: both`) and expose Geyser's direct address. The
+`BedrockLanStatus` therefore carries `directEndpoints` (`<ip>:19133`) and the LAN
+card shows **Add Server `<phone-ip>:19133`** as the fallback for newer clients,
+while the 19132 bridge covers RakNet-era clients and the Friends/LAN list.
+
+Two honest limits: (a) on Android/bionic Geyser's NetherNet native library may
+fail to load (`libdatachannel` / JVM libc detection); the app detects those
+console lines and explains it as a Geyser plugin-native limitation, not a
+JavaHost bug; (b) **MCPE-239883** — some 2026 clients fail to list a server even
+when it returns a valid pong — plus the ongoing NetherNet transition means the
+docs/UI do not promise universal LAN/Friends visibility. The LAN card's manual
+addresses are the reliable path.
+
+### Security and power notes
+
+The relay intentionally binds UDP 19132 on all LAN interfaces — that is what
+makes the phone discoverable — but its upstream side is loopback-only, so it
+creates no new internet exposure and needs no new permission beyond `INTERNET`
+and the local-network access the app already declares. It runs only while the
+server runs; it is reply-only (the unsolicited beacon is off) and client sessions
+are UDP, so CPU/battery cost is negligible next to the JVM. NetherNet/WebRTC
+traffic on 19134 is handled inside the child JVM by Geyser, not by the app. The
+server's own authentication (Geyser/Floodgate, `online-mode`, white-list) stays
+the security boundary; on untrusted networks turn the bridge off. IPv6 LAN
+discovery is not implemented.
 
 ## Persistence stack
 

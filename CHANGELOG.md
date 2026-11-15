@@ -1,5 +1,96 @@
 # Changelog
 
+## 1.3.0 — 2026-11-15
+
+Adds **Bedrock Edition LAN hosting**: with Geyser + Floodgate installed,
+RakNet-era Bedrock clients on the same Wi-Fi/hotspot can see the server in the
+LAN/Friends list again, not only via manual “Add Server”. Newer NetherNet-only
+clients use Geyser's direct address — see the known limitations below.
+
+### Root cause
+Bedrock does not use Java's multicast announcement. A Bedrock client broadcasts a
+**RakNet Unconnected Ping** on UDP `19132` and lists a server only when something
+answers with an **Unconnected Pong** from the address the client should connect
+to. Geyser does not reliably provide that on Android/plugin setups (the Geyser
+wiki itself suggests adding the server manually), and Geyser owns UDP `19132`, so
+the app could not answer the pings itself.
+
+### Fix — Phantom-style Bedrock LAN bridge
+- **The app owns UDP 19132.** While a Minecraft server with Geyser runs and
+  **Bedrock LAN bridge (Geyser)** is on (default), JavaHost binds UDP `19132`
+  and answers RakNet pings itself. Pongs are rewritten to advertise port `19132`
+  and the bridge's GUID; every other datagram is relayed to Geyser through one
+  upstream socket per client (max 32 clients, idle sessions closed after 120 s).
+- **Geyser moves to UDP 19133** so the bridge can own 19132. Geyser 2.12.1
+  removed the RakNet-only transport and **defaults to NetherNet**, which does not
+  start the RakNet listener the bridge needs, so the bridge patches
+  `plugins/Geyser-*/config.yml` `bedrock.port` to 19133 **and** (when those keys
+  exist) `bedrock.transport` to `both` and `bedrock.webrtc-port` to 19134,
+  preserving every other byte. The JVM also gets
+  `GEYSER_BEDROCK_PORT=19133`, `GEYSER_BEDROCK_TRANSPORT=both`,
+  `GEYSER_BEDROCK_WEBRTC_PORT=19134` and `GEYSER_BEDROCK_ADDRESS=0.0.0.0`
+  (Geyser ≥2.12 `GEYSER_<PATH>` env overrides, for builds without env support it
+  patches the config instead). When the bridge is turned off only the **port** is
+  restored; `transport: both` and `webrtc-port: 19134` stay, so both client
+  generations keep working.
+- **Reply-only LAN answering:** the bridge answers the clients' own Unconnected
+  Pings from UDP 19132 and relays their datagrams to Geyser (Phantom-style). The
+  relay also has an unsolicited pong beacon, but it is disabled in 1.3.0 because
+  broadcast pongs are untested against real clients and can confuse the LAN list.
+- **Live status:** a RakNet ping every few seconds tells the app whether Geyser
+  is actually reachable and publishes the MOTD, Bedrock version, protocol and
+  players (`3/10`). The LAN card's new **Bedrock Edition** block shows the bridge
+  address `<ip>:19132` **and** Geyser's direct address `<ip>:19133` for every
+  usable LAN address, the Geyser status and any warning.
+- **Setting:** **Bedrock LAN bridge (Geyser)** on the server's LAN card and in
+  **Settings** (on by default). It takes effect at the next server start/restart,
+  because Geyser's listen port is fixed when the JVM launches.
+- No new Android permissions: the bridge uses the existing `INTERNET` socket
+  access (`ACCESS_LOCAL_NETWORK` was already declared in 1.2.0).
+- 419 hermetic unit tests (0 failures, 3 environment-gated skips; new RakNet codec,
+  loopback UDP relay and Geyser
+  config suites; subnet-broadcast cases added to the LAN selector tests).
+- **Release note:** the 1.3.0 APK is signed with the same development key as
+  1.2.0, so it installs as an **in-place upgrade**; instances, worlds, plugins and
+  settings are preserved.
+
+### Known limitations
+- **Geyser + Floodgate are required.** The bridge does not translate Bedrock
+  itself; it makes a working Geyser setup discoverable. A Vanilla/Fabric/Forge
+  server cannot accept Bedrock clients.
+- **Applies at the next server start/restart.** Turning the switch on while a
+  server runs updates the card and setting, but the Geyser port/transport change
+  and the UDP 19132 relay start with the next launch.
+- **IPv6 LAN discovery is not covered.** The bridge advertises the IPv4 address
+  on `19132`; IPv6-only networks are out of scope.
+- **Newer Bedrock clients use NetherNet, not RakNet.** Bedrock 26.60 (October
+  2026) clients no longer join over RakNet and use Geyser's NetherNet/WebRTC
+  transport instead. The bridge restores LAN/Friends discovery and joins for
+  RakNet-era clients and for a Geyser running `transport: both`, but a
+  **NetherNet-only client may not join through 19132**. Use Geyser's direct
+  address **Add Server `<phone-ip>:19133`**, also shown on the LAN card. On
+  Android/bionic Geyser's NetherNet native library may fail to load entirely — a
+  plugin-native limitation that the console surfaces.
+- **Some client-side LAN-list bugs are not fixable here.** Some 2026 Bedrock
+  clients fail to list a server even when it returns a valid pong (Mojang bug
+  **MCPE-239883**), and the NetherNet transition (see the Geyser blog/release
+  notes) is still rolling out; the LAN card's manual addresses are the reliable
+  fallback, not a guarantee of universal LAN-list visibility.
+- **AP/client isolation and router broadcast filtering can still block
+  discovery.** The relay may still work when only broadcasts are filtered — use
+  **Add Server** `<phone-ip>:19132` (or `<phone-ip>:19133` for NetherNet-era
+  clients) as the fallback.
+- **Console Bedrock clients vary by platform and version.** PlayStation, Xbox and
+  Switch builds may hide the LAN/Friends list or the Add Server UI, and newer
+  console versions may be NetherNet-only; use a build that allows manual servers
+  if discovery does not appear.
+- **Windows client firewall.** Allow Minecraft through the Windows firewall for
+  UDP `4445` (Java LAN discovery), UDP `19132` (Bedrock bridge) and, when using
+  the NetherNet fallback, Geyser's direct address `19133`; a blocked inbound
+  rule keeps the LAN list empty even while the phone is announcing.
+- **Java LAN is unchanged.** Both editions can be discovered at the same time:
+  Java via multicast `224.0.2.60:4445`, Bedrock via the `19132` bridge.
+
 ## 1.2.0 — 2026-11-15
 
 Fixes the “server is running but LAN clients cannot connect / Minecraft never

@@ -50,6 +50,30 @@ used for the LAN announcement; `ACCESS_LOCAL_NETWORK` is declared ahead of
 Android 17's local-network consent (Android 16 opt-in equivalent) so a future
 higher-target build is ready for it.
 
+## Bedrock Edition LAN bridge (1.3.0)
+
+Bedrock clients discover LAN servers over RakNet, so a Geyser setup is made
+discoverable by an app-side bridge: the app owns UDP `19132` while Geyser is moved
+to `19133` and set to `transport: both` (RakNet + NetherNet, with NetherNet WebRTC
+on `19134`). Bedrock translation itself remains Geyser + Floodgate's job.
+
+| Requirement | Status | Where |
+|---|---|---|
+| RakNet LAN relay: bind UDP `19132` (`SO_BROADCAST` only, **no** `SO_REUSEADDR` so it fails loudly if Geyser still owns the port), relay client datagrams including pings to Geyser at `127.0.0.1:19133` through one socket per client, send server datagrams back via the listening socket with rewritten pongs; reply-only (no unsolicited beacon); max 32 clients, idle sessions 120 s | Verified (pure-JVM loopback UDP tests: ping answered, both-way relay, clients isolated, no-reuse/busy port); real LAN **Manual-only** | `core/net/BedrockRakNet.kt`, `core/net/BedrockLanRelay.kt`, `ServerManager` |
+| Pong rewrite + `MCPE;…;` server-id descriptor: forces advertised IPv4/IPv6 port `19132` and the bridge GUID, forwards client ping bytes unchanged, keeps unknown trailing fields, supports missing ports | Verified (hermetic codec tests) | `core/net/BedrockRakNet.kt` |
+| Beacon: unsolicited pong re-broadcast to `255.255.255.255` + each interface's subnet broadcast | Implemented in the relay but **disabled in 1.3.0** (reply-only, Phantom-style) — broadcasts are untested against real clients and can confuse the LAN list | `BedrockLanRelay`, `LanAddressSelector.subnetBroadcast` |
+| Geyser port + transport: env `GEYSER_BEDROCK_PORT=19133`, `GEYSER_BEDROCK_TRANSPORT=both`, `GEYSER_BEDROCK_WEBRTC_PORT=19134`, `GEYSER_BEDROCK_ADDRESS=0.0.0.0`, plus atomic `prepareForBridge` config patch (`bedrock.port`, and `bedrock.transport: both` / `bedrock.webrtc-port: 19134` only when those keys exist; legacy `bedrock-port` understood) with a sidecar that restores **only the port** on disable | Verified (config patch/restore tests; env applied when the child JVM launches) | `core/net/BedrockGeyserConfig.kt`, `ServerManager`, sidecar file |
+| Geyser polling (MOTD/version/protocol/players/reachability) and LAN-card **Bedrock Edition** block showing the bridge `<ip>:19132` + Geyser direct `<ip>:19133` endpoints, with the **Bedrock LAN bridge (Geyser)** setting (on by default, applies at next start/restart) | Implemented (Compose; compile-tested); live status needs a real Geyser server | `ServerManager`, `ServerDetailScreen.kt`, `SettingsScreen.kt`, `AppSettings.bedrockLanDiscovery` |
+| NetherNet-era clients (Bedrock 26.60+, Oct 2026, no longer join over RakNet): Geyser direct `<ip>:19133` shown for manual Add Server; console surfaces Geyser's NetherNet native-library failure on Android/bionic as a plugin-native limitation; MCPE-239883 client listing bug documented | Implemented in UI/status (compile-tested); real NetherNet client **Manual-only** | `ServerManager` (`directEndpoints`), `ServerDetailScreen.kt`, docs |
+| No new permissions: bridge uses the existing `INTERNET` UDP sockets and the local-network access already declared | Implemented (manifest unchanged in 1.3.0) | `AndroidManifest.xml` |
+
+Note: the bridge does not make a Vanilla/Fabric/Forge server accept Bedrock
+clients — Geyser-Spigot + Floodgate on Paper/Spigot are still required, and the
+port/transport change only takes effect at a server start/restart. Geyser 2.12.1
+defaults to NetherNet, so `transport: both` is what keeps the RakNet listener (and
+the whole LAN bridge) working; only the port is restored when the bridge is
+disabled.
+
 ## Process persistence
 
 | Requirement | Status | Where |
@@ -106,12 +130,15 @@ higher-target build is ready for it.
 7. **Play policy risk** — APK targetSdk 28; `docs/POLICY.md` documents the sideload strategy and a Play variant would need a different execution strategy and the media hack removed.
 8. **JRE size** — not in APK; downloaded from Termux mirrors with SHA-256 verification (~96–117 MB per major, ~170 MB installed).
 9. **LAN discovery is best-effort** — the Minecraft announcement is an emulation of “Open to LAN”, not a protocol dedicated servers implement. Clients must be on the same Wi-Fi/hotspot; AP/client isolation and guest networks block LAN traffic; some clients/versions do not scan the LAN list, and Bedrock clients still need Geyser/Floodgate. The LAN card's manual address is authoritative.
+10. **Bedrock LAN is best-effort too** — the 19132 bridge makes a **Geyser-Spigot + Floodgate** setup discoverable over RakNet (IPv4 only, applied at the next server start; Geyser is set to `transport: both` because 2.12.1 defaults to NetherNet). AP/client isolation, router broadcast filtering and Windows client firewalls can still block discovery. **Bedrock 26.60+ clients use NetherNet and may not join through 19132** — use Geyser's direct **Add Server** `<phone-ip>:19133`; Geyser's NetherNet native library may not load on Android/bionic (plugin-native limitation), some 2026 clients fail to list a valid pong (MCPE-239883), and console Bedrock builds vary.
 
 ## Not testable in this environment
 
 On-device FGS/Doze/swipe/notification rendering, SAF provider interactions,
-actual `exec()` from the app sandbox on a retail ROM, and the real-network LAN
-paths (multicast announcement, AP/client isolation, Android 16/17 local-network
-consent): no device/emulator/ADB was available. `docs/TESTING.md` marks these as
-manual-only and provides the full checklist; the host-level integration evidence
-is in that file.
+actual `exec()` from the app sandbox on a retail ROM, the real-network LAN paths
+(multicast announcement, AP/client isolation, Android 16/17 local-network
+consent), the Bedrock bridge's real LAN discovery/relay and the NetherNet direct
+path (need a Geyser server plus Bedrock clients of both generations, and Geyser's
+NetherNet native library on the phone): no device/emulator/ADB was available.
+`docs/TESTING.md` marks these as manual-only and provides the full checklist;
+the host-level integration evidence is in that file.

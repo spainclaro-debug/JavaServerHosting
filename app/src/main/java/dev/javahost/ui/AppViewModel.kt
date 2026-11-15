@@ -31,6 +31,7 @@ import dev.javahost.core.model.ServerKind
 import dev.javahost.core.model.ServerRuntimeStatus
 import dev.javahost.core.model.StartResult
 import dev.javahost.core.model.UiMessage
+import dev.javahost.core.net.BedrockGeyserConfig
 import dev.javahost.core.service.ForegroundServerService
 import dev.javahost.core.storage.SafePaths
 import dev.javahost.core.storage.ServerPropertiesCodec
@@ -93,7 +94,8 @@ class AppViewModel(application: Application) : AndroidViewModel(application), Ap
         }
         viewModelScope.launch {
             container.instances.instances.collect { instances ->
-                _state.update { it.copy(instances = instances) }
+                val bedrockDetected = detectBedrockInstances(instances)
+                _state.update { it.copy(instances = instances, bedrockDetected = bedrockDetected) }
             }
         }
         viewModelScope.launch {
@@ -671,6 +673,8 @@ class AppViewModel(application: Application) : AndroidViewModel(application), Ap
     override fun setAutoRestart(enabled: Boolean) = updateSettings { it.copy(autoRestartOnCrash = enabled) }
     override fun setMinecraftLanDiscovery(enabled: Boolean) =
         updateSettings { it.copy(minecraftLanDiscovery = enabled) }
+    override fun setBedrockLanDiscovery(enabled: Boolean) =
+        updateSettings { it.copy(bedrockLanDiscovery = enabled) }
 
     override fun setInstanceJvmArgs(id: String, args: String) {
         container.instances.update(id) { it.copy(jvmArgs = args.trim()) }
@@ -887,6 +891,33 @@ class AppViewModel(application: Application) : AndroidViewModel(application), Ap
         val cleaned = sanitizeFileName(name)
         return if (cleaned.lowercase(Locale.ROOT).endsWith(".jar")) cleaned else "$cleaned.jar"
     }
+
+    /**
+     * Cheap per-instance Geyser probe for the LAN card while no server is running.
+     * Mirrors ServerManager's detection: a Geyser `config.yml` inside the plugins
+     * directory, a Geyser plugin JAR in `plugins/`, or a Fabric Geyser mod JAR in
+     * `mods/`. Runs off the main thread and never throws.
+     */
+    private suspend fun detectBedrockInstances(instances: List<ServerInstance>): Map<String, Boolean> =
+        withContext(Dispatchers.IO) {
+            instances.associate { instance ->
+                instance.id to runCatching { hasGeyserInstalled(instance.id) }.getOrDefault(false)
+            }
+        }
+
+    private fun hasGeyserInstalled(instanceId: String): Boolean {
+        val pluginsDir = container.paths.pluginsDir(instanceId)
+        if (BedrockGeyserConfig.findConfigFile(pluginsDir) != null) return true
+        if (hasGeyserJar(pluginsDir)) return true
+        return hasGeyserJar(container.paths.modsDir(instanceId))
+    }
+
+    private fun hasGeyserJar(dir: File): Boolean =
+        dir.listFiles().orEmpty().any { file ->
+            file.isFile &&
+                file.extension.equals("jar", ignoreCase = true) &&
+                file.name.lowercase(Locale.ROOT).contains("geyser")
+        }
 
     override fun onCleared() {
         // The child JVM belongs to the foreground service, not the ViewModel.

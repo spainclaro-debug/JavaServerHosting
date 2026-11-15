@@ -13,21 +13,32 @@ enum class LanKind { WIFI, ETHERNET, HOTSPOT, OTHER }
  * @property isUp whether the interface is up and running.
  * @property isLoopback whether the interface is the loopback interface.
  * @property isPointToPoint whether the interface is point-to-point (e.g. a tunnel).
+ * @property prefixLength IPv4 network prefix length (`/24` -> 24), used to compute
+ *   the subnet broadcast address for the Bedrock LAN beacon. Defaults to 24 so
+ *   call sites that only care about the address keep working.
  */
 data class LanInterface(
     val name: String,
     val address: String,
     val isUp: Boolean = true,
     val isLoopback: Boolean = false,
-    val isPointToPoint: Boolean = false
+    val isPointToPoint: Boolean = false,
+    val prefixLength: Int = 24
 )
 
-/** A LAN-reachable IPv4 address on a specific interface, ready to show to the user. */
+/**
+ * A LAN-reachable IPv4 address on a specific interface, ready to show to the user.
+ *
+ * @property prefixLength IPv4 network prefix length of the source interface
+ *   (`/24` -> 24), used by the Bedrock LAN beacon to compute the subnet
+ *   broadcast address. Defaults to 24 so older call sites keep working.
+ */
 data class LanEndpoint(
     val address: String,
     val interfaceName: String,
     val kind: LanKind,
-    val label: String
+    val label: String,
+    val prefixLength: Int = 24
 ) {
     /** `address:port`, e.g. `192.168.1.50:4567`. */
     fun hostPort(port: Int): String = LanAddressSelector.hostPort(address, port)
@@ -134,6 +145,30 @@ object LanAddressSelector {
     fun hostPort(address: String, port: Int): String = "$address:$port"
 
     /**
+     * The directed broadcast address of the IPv4 subnet [address] belongs to,
+     * e.g. `192.168.1.255` for `192.168.1.50/24`.
+     *
+     * Returns `null` when [address] is not a strict dotted-quad IPv4 address or
+     * [prefixLength] is outside `1..32`. `/32` has no host bits, so it returns
+     * the address itself; `/0` is rejected because `255.255.255.255` is not a
+     * usable per-interface broadcast target.
+     */
+    fun subnetBroadcast(address: String, prefixLength: Int): String? {
+        if (prefixLength !in 1..32) return null
+        val octets = parseIPv4(address) ?: return null
+        val ip = (octets[0].toLong() shl 24) or
+            (octets[1].toLong() shl 16) or
+            (octets[2].toLong() shl 8) or
+            octets[3].toLong()
+        val hostMask = if (prefixLength == 32) 0L else (1L shl (32 - prefixLength)) - 1L
+        val broadcast = ip or hostMask
+        return "${(broadcast shr 24) and 0xFF}." +
+            "${(broadcast shr 16) and 0xFF}." +
+            "${(broadcast shr 8) and 0xFF}." +
+            "${broadcast and 0xFF}"
+    }
+
+    /**
      * Selects the usable LAN endpoints from an interface snapshot, in display order.
      *
      * Keeps only interfaces that are up, not loopback, not point-to-point, carry a
@@ -147,7 +182,7 @@ object LanAddressSelector {
             .filter { isUsable(it) }
             .map { iface ->
                 val kind = classify(iface.name)
-                LanEndpoint(iface.address, iface.name, kind, label(kind))
+                LanEndpoint(iface.address, iface.name, kind, label(kind), iface.prefixLength)
             }
             .sortedWith(ENDPOINT_ORDER)
             .toList()
