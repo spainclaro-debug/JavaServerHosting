@@ -12,8 +12,8 @@ Run:
 ./gradlew :app:testDebugUnitTest
 ```
 
-Final run in this environment for the 1.3.0 suite: **419 hermetic tests,
-0 failures, 0 errors, 3 skipped** (327 before this release; the skipped tests are
+Final run in this environment for the 1.4.0 suite: **424 hermetic tests,
+0 failures, 0 errors, 3 skipped** (419 before this release; the skipped tests are
 environment-gated real-archive/real-JRE smoke tests that only run when their
 fixture variables are provided).
 
@@ -29,12 +29,16 @@ Coverage by area:
 | Storage | `ServerPropertiesCodecTest` — `server.properties` parse/format (comments/order/unknown keys), port validation, `server-ip` get/set/loopback-normalisation cases; `FileBrowserSafetyTest` — path/symlink containment |
 | LAN (new in 1.2.0) | `core/net/LanAddressTest` — private-IPv4/loopback checks, cellular/VPN interface rejection, kind classification/labels, dedupe and `WIFI < ETHERNET < HOTSPOT < OTHER` ordering, subnet broadcast maths (`/8`, `/24`, `/32`, invalid), empty/all-filtered input; `core/net/MinecraftLanAnnouncementTest` — message/payload format, MOTD sanitisation, port validation; `core/net/LanProbeTest` — `REACHABLE`/`REFUSED`/`TIMEOUT`/`ERROR` mapping, latency, host/port validation, no exception on bad input; plus the `server-ip` cases in `ServerPropertiesCodecTest` |
 | Bedrock (new in 1.3.0) | `core/net/BedrockRakNetTest` — ping detection/build, pong parse/build, MAGIC and length checks, `MCPE;…` server-id parse/build round-trips with missing ports and unknown trailing fields, pong rewrite (port/GUID, echoed ping time preserved) invalid-input safety; `core/net/BedrockLanRelayTest` — loopback UDP harness: client ping bytes forwarded unchanged and the reply pong rewritten with the advertised port + relay GUID, non-ping datagrams relayed both ways through a mock upstream socket, two clients isolated, busy port (no `SO_REUSEADDR`) makes `start()` return false, a non-positive beacon interval sends no unsolicited pong bytes, idle/stop cleanup; `core/net/BedrockGeyserConfigTest` — config discovery, modern `bedrock:`/`port:` and legacy `bedrock-port:` patching, `prepareForBridge` transport/WebRTC cases (`transport` absent → no-op, `nethernet` → `both`, `webrtc-port 0` → `19134`, idempotent), comments/CRLF/indentation preserved, port-only restore happy/no-op, atomic write |
+| Service lifecycle (new in 1.4.0) | `core/service/ServiceLifecycleDecisionsTest` — exhaustive truth table for `decideStart` (`ADOPT_RUNNING`, `QUEUE_AFTER_STOP`, `CLEAR_STALE_THEN_START`, `START_FRESH`) and `decideRestart` (`RESTART_EXISTING`, `CLEAR_STALE_THEN_START`, `START_FRESH`) over active/stopping/idle runtime states with and without a real session; verifies the stale-runtime and start-during-stop cases that caused the 1.3.0 bug. `ServerManager`'s fast-stop constants/escalation are review-verified; real service timing is manual-only |
+| Theme (new in 1.4.0) | no unit-testable logic: the light/dark Material 3 schemes live in `ui/theme/Theme.kt` and are compile-checked; text contrast, active-card accent and dark-mode regression are verified on-device (manual checklist 6g). The palette values are asserted by inspection against `docs/ARCHITECTURE.md` |
 | System | safe/auto heap math, battery/notification state helpers |
 | Misc | log rotation/tail, heap-sampler parsing, generic TCP connection counter, EULA text |
 
 Android-framework-dependent classes (foreground service, notifications,
 wakelocks, intents, `ActivityManager`) are covered by compile checks and the
-manual checklist below — not by Robolectric/instrumentation in this build.
+manual checklist below — not by Robolectric/instrumentation in this build. The
+foreground service's start/stop/restart decisions are additionally covered by
+the pure-JVM `ServiceLifecycleDecisionsTest`.
 
 ## Host-level integration validation
 
@@ -55,7 +59,7 @@ Android app sandbox, foreground service or Doze.
 | Modrinth API live smoke | ✅ search `worldedit` plugins for 1.20.4/paper returned hits; project versions returned a primary `.jar` (16 KB, SHA-1 present); file HEAD → HTTP 200. UA/facets/encoding validated manually; not part of the hermetic suite |
 | Termux mirror smoke (live) | ✅ `Packages.gz` 732 KB → parsed 3,029 packages; real `openjdk-21` deb chain downloaded with SHA-256 verification and extracted to a runnable JRE |
 | Mirror speed probe (host/dev network) | ✅ TUNA ~2.9 MB/s, MWT ~2.5 MB/s, Grimler ~1.4 MB/s, USTC ~0.7 MB/s, BFSU ~0.4 MB/s on a 3 MB range request; auto-probe ordering is unit-tested without network |
-| Full Gradle unit suite | ✅ 419 tests, 0 failures, 0 errors, 3 skipped |
+| Full Gradle unit suite | ✅ 424 tests, 0 failures, 0 errors, 3 skipped (exact count in the v1.4.0 release) |
 
 ### LAN smoke check (JVM)
 
@@ -120,7 +124,7 @@ classes (no Android device and no Geyser install needed):
    6e).
 
 Results for a release are recorded with that release's artifacts (see the
-v1.3.0 release).
+v1.4.0 release).
 
 Known host-level quirks observed:
 
@@ -188,6 +192,22 @@ Not executed in this build environment (no device or emulator attached).
    Then turn the bridge off, restart and confirm `bedrock.port` is restored to
    its original value while `transport: both` and `webrtc-port: 19134` stay, and
    that the bridge and discovery stop.
+6f. **Stop → Start / Restart reliability** — start a Minecraft server, press
+   **Stop** and confirm the notification disappears in under ~2 s. Press
+   **Start** while the “Stopping…” notification is still visible: the server must
+   start immediately after the stop, in the same service session, without
+   restarting the app. Press **Restart** several times in a row: the newly
+   started JVM must survive, and only one foreground service/notification may
+   exist. Then simulate a stale runtime (e.g. let the ROM kill the child and
+   reopen the app) and confirm Start recovers via the internal force-stop.
+   Confirm **Force stop** still kills a genuinely wedged child.
+6g. **Light theme** — switch the system to light mode: the app must use the cream
+   background (`#F0E4C8`) and brown accent (`#5A4C39`); the active server card,
+   its `RUNNING` pill and the active server's status card must use the accent,
+   and every screen (home, create, detail, console, files, settings, dialogs,
+   properties editor) must stay readable with dark text on cream. Switch to dark
+   mode and confirm the previous ink/teal theme is unchanged. Keep screenshots
+   for the release notes.
 7. **Screen off** — start a server, turn the screen off for 15+ minutes, confirm
    the process stays alive and the console keeps flowing.
 7. **Doze** — leave the device idle/unplugged for 30+ minutes with the
@@ -223,3 +243,7 @@ Not executed in this build environment (no device or emulator attached).
   logic, but real broadcast/client listing, the NetherNet direct path and whether
   Geyser's NetherNet native library loads on the phone are manual-only (checklist
   item 6e).
+- The real service Stop → Start / Restart transitions, stop timings and
+  light/dark theme contrast can only be verified on a device; the hermetic
+  `ServiceLifecycleDecisionsTest` covers the decision logic and the rest is
+  checklist items 6f–6g.

@@ -38,8 +38,7 @@ import dev.javahost.ui.components.ScreenScaffold
 import dev.javahost.ui.components.SectionCard
 import dev.javahost.ui.components.SuccessRow
 import dev.javahost.ui.components.formatMegabytes
-import dev.javahost.ui.theme.TealGreen
-import dev.javahost.ui.theme.WarnAmber
+import dev.javahost.ui.theme.javaHostStatusColors
 
 @Composable
 fun SettingsScreen(
@@ -82,7 +81,7 @@ fun SettingsScreen(
                     Text(
                         "Java ${settings.defaultJreMajor} is not installed. New servers will need it before they can start.",
                         style = MaterialTheme.typography.labelSmall,
-                        color = WarnAmber
+                        color = javaHostStatusColors().warning
                     )
                 }
                 Row(verticalAlignment = Alignment.CenterVertically) {

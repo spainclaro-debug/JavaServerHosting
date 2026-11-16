@@ -1,5 +1,6 @@
 package dev.javahost.ui.screens
 
+import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -33,6 +34,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.text.AnnotatedString
@@ -61,9 +63,7 @@ import dev.javahost.ui.components.formatBytes
 import dev.javahost.ui.components.formatMegabytes
 import dev.javahost.ui.components.formatTimestamp
 import dev.javahost.ui.components.formatUptime
-import dev.javahost.ui.theme.Danger
-import dev.javahost.ui.theme.TealGreen
-import dev.javahost.ui.theme.WarnAmber
+import dev.javahost.ui.theme.javaHostStatusColors
 
 private const val DETAIL_EULA_URL = "https://aka.ms/MinecraftEULA"
 
@@ -83,7 +83,16 @@ fun ServerDetailScreen(
     val live = state.instance(instance.id) ?: instance
     val runtime = state.runtime
     val uriHandler = LocalUriHandler.current
+    val statusColors = javaHostStatusColors()
     val isThisActive = runtime.instanceId == live.id && runtime.isActive
+    // The Status pill sits on the accent container while this server is active. The
+    // accent RUNNING colour is only ~2.7:1 on the dark container, so reuse the
+    // high-contrast active-card colour (White in dark, ink accent in light).
+    val activePillColor = if (isThisActive) {
+        if (isSystemInDarkTheme()) Color.White else MaterialTheme.colorScheme.primary
+    } else {
+        null
+    }
     val running = isThisActive && runtime.state == RunState.RUNNING
     val jreInstalled = state.isInstalled(live.jreMajor)
     val eulaOk = !live.isMinecraft || live.eulaAccepted
@@ -127,10 +136,17 @@ fun ServerDetailScreen(
             /* ---------------- Status + controls ---------------- */
             SectionCard(
                 title = "Status",
+                containerColor = if (isThisActive) {
+                    MaterialTheme.colorScheme.primaryContainer
+                } else {
+                    MaterialTheme.colorScheme.surface
+                },
+                borderColor = if (isThisActive) MaterialTheme.colorScheme.primary else null,
                 trailing = {
                     StatePill(
                         if (isThisActive) mainRunStateLabel(runtime.state) else mainRunStateLabel(RunState.STOPPED),
-                        if (isThisActive) runtime.state else RunState.STOPPED
+                        if (isThisActive) runtime.state else RunState.STOPPED,
+                        colorOverride = activePillColor
                     )
                 }
             ) {
@@ -202,7 +218,7 @@ fun ServerDetailScreen(
                         else -> null
                     }
                     if (reason != null) {
-                        Text(reason, style = MaterialTheme.typography.labelSmall, color = WarnAmber)
+                        Text(reason, style = MaterialTheme.typography.labelSmall, color = statusColors.warning)
                     }
                 }
                 if (running) {
@@ -240,7 +256,7 @@ fun ServerDetailScreen(
                         Text(
                             warning,
                             style = MaterialTheme.typography.bodyMedium,
-                            color = WarnAmber
+                            color = statusColors.warning
                         )
                     }
                     lan.summary?.let { summary ->
@@ -324,7 +340,7 @@ fun ServerDetailScreen(
                 SectionCard(
                     title = "Last run failed",
                     subtitle = live.lastCrashSummary ?: crashInfo?.summary?.ifBlank { null } ?: "The server exited unexpectedly",
-                    trailing = { Tag("Crash", Danger) }
+                    trailing = { Tag("Crash", statusColors.danger) }
                 ) {
                     crashInfo?.let { crash ->
                         InfoRow("Reason", mainExitReasonLabel(crash.reason))
@@ -425,7 +441,7 @@ fun ServerDetailScreen(
                         "Above the automatic pick. This device's safe ceiling is ${formatMegabytes(safeMaxMb)}; " +
                             "Android may still kill the process under memory pressure.",
                         style = MaterialTheme.typography.labelSmall,
-                        color = WarnAmber
+                        color = statusColors.warning
                     )
                 }
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -535,7 +551,7 @@ fun ServerDetailScreen(
                 )
                 Button(
                     onClick = { showDelete = true },
-                    colors = ButtonDefaults.buttonColors(containerColor = Danger),
+                    colors = ButtonDefaults.buttonColors(containerColor = statusColors.danger),
                     modifier = Modifier.fillMaxWidth()
                 ) { Text("Delete server") }
             }
@@ -606,6 +622,7 @@ fun ServerDetailScreen(
 @Composable
 private fun LanEndpointRow(endpoint: LanEndpointInfo, showUrl: Boolean) {
     val clipboard = LocalClipboardManager.current
+    val statusColors = javaHostStatusColors()
     // Generic servers are usually opened in a browser, so copy the full URL;
     // Minecraft clients take "address:port" directly.
     val copyText = endpoint.url ?: endpoint.hostPort ?: endpoint.address
@@ -633,7 +650,7 @@ private fun LanEndpointRow(endpoint: LanEndpointInfo, showUrl: Boolean) {
                         Text(
                             url,
                             style = MaterialTheme.typography.labelSmall,
-                            color = TealGreen
+                            color = statusColors.success
                         )
                     }
                 }
@@ -647,7 +664,8 @@ private fun LanEndpointRow(endpoint: LanEndpointInfo, showUrl: Boolean) {
 
 @Composable
 private fun LanProbeResultRow(probe: LanProbeInfo) {
-    val color = if (probe.ok) TealGreen else Danger
+    val statusColors = javaHostStatusColors()
+    val color = if (probe.ok) statusColors.success else statusColors.danger
     Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
         Icon(
             imageVector = if (probe.ok) Icons.Default.CheckCircle else Icons.Default.Warning,
@@ -704,6 +722,7 @@ private fun BedrockLanBlock(
     isActive: Boolean,
     onEnabledChange: (Boolean) -> Unit
 ) {
+    val statusColors = javaHostStatusColors()
     Text("Bedrock Edition", style = MaterialTheme.typography.labelLarge)
     if (!geyserDetected) {
         Text(
@@ -765,7 +784,7 @@ private fun BedrockLanBlock(
             Text(
                 if (details.isEmpty()) line else "$line ($details)",
                 style = MaterialTheme.typography.bodyMedium,
-                color = TealGreen
+                color = statusColors.success
             )
         }
 
@@ -776,7 +795,7 @@ private fun BedrockLanBlock(
                 "sets transport to both with WebRTC on UDP 19134, so verify the Geyser config if " +
                 "this persists.",
             style = MaterialTheme.typography.bodyMedium,
-            color = WarnAmber
+            color = statusColors.warning
         )
     }
     if (status.directEndpoints.isNotEmpty()) {
@@ -797,7 +816,7 @@ private fun BedrockLanBlock(
             Text(
                 warning,
                 style = MaterialTheme.typography.bodyMedium,
-                color = WarnAmber
+                color = statusColors.warning
             )
         }
     }

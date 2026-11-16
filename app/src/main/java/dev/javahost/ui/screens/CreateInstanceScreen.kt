@@ -55,8 +55,7 @@ import dev.javahost.ui.components.ScreenScaffold
 import dev.javahost.ui.components.SectionCard
 import dev.javahost.ui.components.Tag
 import dev.javahost.ui.components.formatMegabytes
-import dev.javahost.ui.theme.TealGreen
-import dev.javahost.ui.theme.WarnAmber
+import dev.javahost.ui.theme.javaHostStatusColors
 
 private data class FlavorChoice(val flavor: ServerFlavor?, val label: String)
 
@@ -201,7 +200,7 @@ fun CreateInstanceScreen(
                         Text(
                             validationHint,
                             style = MaterialTheme.typography.labelSmall,
-                            color = WarnAmber
+                            color = javaHostStatusColors().warning
                         )
                     }
                     Button(
@@ -332,7 +331,7 @@ fun CreateInstanceScreen(
                         "Detected minimum: Java ${baseInspection.suggestedJreMajor}. " +
                             "Using a lower version may fail at startup.",
                         style = MaterialTheme.typography.labelSmall,
-                        color = WarnAmber
+                        color = javaHostStatusColors().warning
                     )
                 }
             }
@@ -455,7 +454,7 @@ fun CreateInstanceScreen(
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                     Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                        Tag("Experimental", WarnAmber)
+                        Tag("Experimental", javaHostStatusColors().warning)
                         if (effectiveInspection.mainClass != null) {
                             Tag("Java ${effectiveInspection.suggestedJreMajor}")
                         }
@@ -490,7 +489,7 @@ private fun DetectionCard(
             )
             Tag(
                 if (overrideFlavor == null) "${(inspection.confidence * 100).toInt()}% match" else "Manual",
-                if (overrideFlavor == null) MaterialTheme.colorScheme.primary else TealGreen
+                if (overrideFlavor == null) MaterialTheme.colorScheme.primary else javaHostStatusColors().success
             )
         }
         LinearProgressIndicator(

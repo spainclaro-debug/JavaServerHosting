@@ -110,7 +110,15 @@ class ServerManager(
 ) : ServerController {
 
     private val appContext: Context = context.applicationContext ?: context
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    /**
+     * Coroutine scope for the controller's background jobs. It is recreated by
+     * [ensureOperational] after [shutdown] because the foreground service is
+     * destroyed after every normal stop and a later Start must work again
+     * without restarting the app process.
+     */
+    @Volatile
+    private var scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val lifecycleMutex = Mutex()
     private val lock = Any()
 
@@ -149,10 +157,19 @@ class ServerManager(
     )
     val consoleLive: SharedFlow<ConsoleEntry> = _consoleLive.asSharedFlow()
 
-    private val consolePublisherJob: Job = scope.launch {
-        while (isActive) {
-            delay(CONSOLE_PUBLISH_INTERVAL_MS)
-            publishConsoleIfDirty()
+    private var consolePublisherJob: Job? = null
+
+    init {
+        startConsolePublisher()
+    }
+
+    private fun startConsolePublisher() {
+        consolePublisherJob?.cancel()
+        consolePublisherJob = scope.launch {
+            while (isActive) {
+                delay(CONSOLE_PUBLISH_INTERVAL_MS)
+                publishConsoleIfDirty()
+            }
         }
     }
 
@@ -189,7 +206,29 @@ class ServerManager(
     // Contract: start
     // =====================================================================
 
+    /**
+     * Revives the controller after a previous [shutdown] (the foreground service
+     * calls it from onDestroy). Historically every normal Stop destroyed the
+     * service, which permanently set [disposed] and made the next Start return
+     * "JavaHost is shutting down." until the app process was killed. This makes
+     * the process-wide singleton usable again.
+     */
+    private fun ensureOperational() {
+        synchronized(lock) {
+            if (!disposed) return
+            disposed = false
+            shutdownOnce.set(false)
+            restartJob?.cancel()
+            restartJob = null
+            scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        }
+        startConsolePublisher()
+    }
+
+    override fun hasActiveSession(): Boolean = synchronized(lock) { session != null }
+
     override fun start(instanceId: String): StartResult {
+        ensureOperational()
         if (!lifecycleMutex.tryLock()) {
             return StartResult.Rejected("Another start/stop/restart operation is still in progress. Try again in a moment.")
         }
@@ -444,6 +483,7 @@ class ServerManager(
     }
 
     override fun restart() {
+        ensureOperational()
         synchronized(lock) {
             if (restartJob?.isActive == true) return
             val current = session ?: return // contract: no-op when nothing is active
@@ -455,6 +495,7 @@ class ServerManager(
     private suspend fun performRestart(instanceId: String) {
         lifecycleMutex.withLock {
             try {
+                ensureOperational()
                 val current = synchronized(lock) { session }
                 if (current != null && current.instanceId == instanceId) {
                     synchronized(lock) {
@@ -611,11 +652,23 @@ class ServerManager(
 
     override fun shutdown() {
         if (!shutdownOnce.compareAndSet(false, true)) return
-        disposed = true
         val current: Session?
+        val oldScope: CoroutineScope
+        val oldPublisher: Job?
         synchronized(lock) {
+            // Capture the generation we are tearing down before anything else:
+            // a concurrent ensureOperational() may already be creating the next
+            // scope/publisher, and shutdown() must only cancel what it captured.
+            disposed = true
+            oldScope = scope
+            oldPublisher = consolePublisherJob
             current = session
             session = null
+        }
+        if (current == null) {
+            // A stale "active" runtime without a session is a ghost snapshot: clear
+            // it so the UI does not keep showing a running card after teardown.
+            resetRuntimeAfterForcedStop(null)
         }
         if (current != null) {
             current.stopRequested = true
@@ -642,8 +695,9 @@ class ServerManager(
                 lastExit = _runtime.value.lastExit
             )
         }
-        consolePublisherJob.cancel()
-        scope.cancel()
+        oldPublisher?.cancel()
+        if (consolePublisherJob === oldPublisher) consolePublisherJob = null
+        oldScope.cancel()
     }
 
     override fun dispose() {
@@ -2312,9 +2366,9 @@ class ServerManager(
         const val LAN_PROBE_TIMEOUT_MS = 2_500
         const val ANNOUNCE_RETRY_MS = 30_000L
         const val LOOPBACK_HOST = "127.0.0.1"
-        const val GRACEFUL_STOP_MAX_MS = 20_000L
+        const val GRACEFUL_STOP_MAX_MS = 8_000L
         const val GENERIC_STOP_GRACE_MS = 2_000L
-        const val KILL_GRACE_MS = 3_000L
+        const val KILL_GRACE_MS = 2_000L
         const val WAIT_POLL_MS = 100L
     }
 }

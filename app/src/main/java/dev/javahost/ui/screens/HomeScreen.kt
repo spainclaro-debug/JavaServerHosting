@@ -1,6 +1,8 @@
 package dev.javahost.ui.screens
 
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
@@ -13,6 +15,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Build
@@ -35,6 +38,7 @@ import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import dev.javahost.core.model.ExitReason
@@ -53,8 +57,7 @@ import dev.javahost.ui.components.Tag
 import dev.javahost.ui.components.formatBytes
 import dev.javahost.ui.components.formatMegabytes
 import dev.javahost.ui.components.formatUptime
-import dev.javahost.ui.theme.Danger
-import dev.javahost.ui.theme.WarnAmber
+import dev.javahost.ui.theme.javaHostStatusColors
 
 /* -------------------------------------------------------------------------- */
 /* Shared, short display labels (used by the Detail screen too)               */
@@ -108,6 +111,7 @@ fun HomeScreen(
     val crash = state.lastCrash
     val crashInstance = state.instance(state.activeInstanceId ?: state.settings.lastActiveInstanceId)
     val active = state.activeInstance
+    val statusColors = javaHostStatusColors()
 
     Scaffold(
         topBar = {
@@ -215,7 +219,7 @@ fun HomeScreen(
                         modifier = Modifier.weight(1f)
                     )
                     if (state.activeInstanceId != null) {
-                        Tag("1 JVM limit", WarnAmber)
+                        Tag("1 JVM limit", statusColors.warning)
                     }
                 }
             }
@@ -264,10 +268,11 @@ private fun CrashBannerCard(
     onDetails: (() -> Unit)?,
     onDismiss: () -> Unit
 ) {
+    val statusColors = javaHostStatusColors()
     SectionCard(
         title = "Server stopped unexpectedly",
         subtitle = crash.summary.ifBlank { mainExitReasonLabel(crash.reason) },
-        trailing = { Tag("Crash", Danger) }
+        trailing = { Tag("Crash", statusColors.danger) }
     ) {
         if (crash.tail.isNotEmpty()) {
             crash.tail.takeLast(3).forEach { line -> CodeLine(line) }
@@ -304,10 +309,18 @@ private fun ActiveServerCard(
     onOpenDetails: () -> Unit
 ) {
     val runtime = state.runtime
+    val accent = MaterialTheme.colorScheme.primary
+    // TealGreen on the dark primaryContainer (TealDeep) is only ~2.7:1, so dark mode
+    // falls back to a near-white title (5.0:1). Light keeps the ink accent (5.96:1).
+    val accentText = if (isSystemInDarkTheme()) Color.White else accent
     SectionCard(
         title = instance.name,
         subtitle = "Active server · ${mainFlavorLabel(instance.flavor)}",
-        trailing = { StatePill(mainRunStateLabel(runtime.state), runtime.state) }
+        containerColor = MaterialTheme.colorScheme.primaryContainer,
+        borderColor = accent,
+        titleColor = accentText,
+        subtitleColor = accentText,
+        trailing = { StatePill(mainRunStateLabel(runtime.state), runtime.state, colorOverride = accentText) }
     ) {
         InfoRow("Uptime", formatUptime(runtime.uptimeMs))
         if (instance.isMinecraft) {
@@ -371,13 +384,25 @@ private fun InstanceCard(
         crashSummary != null -> RunState.CRASHED
         else -> RunState.STOPPED
     }
+    val statusColors = javaHostStatusColors()
+    val accent = MaterialTheme.colorScheme.primary
+    val cardShape = RoundedCornerShape(16.dp)
+    // Same dark-mode fallback as ActiveServerCard (accent-on-container would be ~2.7:1).
+    val activeTitleColor = if (isSystemInDarkTheme()) Color.White else accent
 
     Card(
         modifier = Modifier
             .fillMaxWidth()
-            .clickable(onClick = onOpen),
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-        shape = androidx.compose.foundation.shape.RoundedCornerShape(16.dp),
+            .clickable(onClick = onOpen)
+            .then(if (isThisActive) Modifier.border(2.dp, accent, cardShape) else Modifier),
+        colors = CardDefaults.cardColors(
+            containerColor = if (isThisActive) {
+                MaterialTheme.colorScheme.primaryContainer
+            } else {
+                MaterialTheme.colorScheme.surface
+            }
+        ),
+        shape = cardShape,
         elevation = CardDefaults.cardElevation(defaultElevation = 0.dp)
     ) {
         Column(
@@ -389,18 +414,20 @@ private fun InstanceCard(
                     Text(
                         instance.name,
                         style = MaterialTheme.typography.titleMedium,
+                        color = if (isThisActive) activeTitleColor else MaterialTheme.colorScheme.onSurface,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis
                     )
                     Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                         Tag(mainFlavorLabel(instance.flavor))
                         Tag("Java ${instance.jreMajor}")
-                        if (!instance.isMinecraft) Tag("Experimental", WarnAmber)
+                        if (!instance.isMinecraft) Tag("Experimental", statusColors.warning)
                     }
                 }
                 StatePill(
                     mainRunStateLabel(stateForPill),
-                    stateForPill
+                    stateForPill,
+                    colorOverride = if (isThisActive) activeTitleColor else null
                 )
             }
             InfoRow(
@@ -438,12 +465,12 @@ private fun InstanceCard(
                 !jreInstalled -> Text(
                     "Install Java ${instance.jreMajor} before starting this server.",
                     style = MaterialTheme.typography.labelSmall,
-                    color = WarnAmber
+                    color = statusColors.warning
                 )
                 !eulaOk -> Text(
                     "Accept the Minecraft EULA in server details before starting.",
                     style = MaterialTheme.typography.labelSmall,
-                    color = WarnAmber
+                    color = statusColors.warning
                 )
             }
         }

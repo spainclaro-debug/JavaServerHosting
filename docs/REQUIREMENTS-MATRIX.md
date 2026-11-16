@@ -85,6 +85,22 @@ disabled.
 | Android 12+ Phantom Process Killer guidance, no hardcoded OEM paths | Implemented (version-aware, ADB commands, dontkillmyapp fallback) | `PowerGuides.kt`, `PowerGuideScreen.kt` |
 | Detect unexpected exit, log reason, offer restart | Implemented (classification + reports + notification/UI restart; optional auto-restart with 3-attempt cap) | `ExitClassifier.kt`, `ServerManager`, `ForegroundServerService` |
 
+## Stop/start/restart reliability & theme (1.4.0)
+
+| Requirement | Status | Where |
+|---|---|---|
+| Stop → Start works without restarting the app: `ServerManager` is revivable after service teardown (`ensureOperational` recreates scope/console publisher, clears disposed/shutdownOnce); idle `onDestroy()` no longer disposes the process-wide controller; `hasActiveSession()` distinguishes a real session from a stale runtime | Implemented; decision logic unit-tested, device lifecycle **Manual-only** | `core/service/ForegroundServerService.kt`, `core/server/ServerManager.kt`, `core/api/ServerController.kt` |
+| Start pressed while `STOPPING` is queued and starts immediately after the stop in the same service operation (no teardown between) | Verified via `ServiceLifecycleDecisionsTest` (`QUEUE_AFTER_STOP` case); service wiring compile-checked | `core/service/ServiceLifecycleDecisions.kt`, `ForegroundServerService.kt` |
+| Restart stays one service operation: restart-in-flight guard ignores the transient stopped state, waits bounded for the new session and keeps the service alive | Verified via decision tests; wiring compile-checked, device **Manual-only** | `ServiceLifecycleDecisions.kt`, `ForegroundServerService.kt` |
+| Fast bounded stop: 8 s Minecraft save + 2 s `SIGTERM` grace + `SIGKILL` escalation, notification cleared on terminal state; manual Force Stop retained | Implemented (constants/escalation in `ServerManager`); timing **Manual-only** | `core/server/ServerManager.kt`, `ForegroundServerService.kt` |
+| Stale-runtime recovery: runtime active but no session → `forceStop()` then fresh start (also used by manual Force Stop) | Verified via `ServiceLifecycleDecisionsTest` (`CLEAR_STALE_THEN_START`); device **Manual-only** | `ServiceLifecycleDecisions.kt`, `ForegroundServerService.kt`, `ServerManager.forceStop` |
+| Light theme: cream background `#F0E4C8`, brown accent `#5A4C39`, readable on-colours; dark scheme unchanged; active server cards/status card and `RUNNING` state pill use the accent (`primaryContainer`/`primary`); `SectionCard` optional container/border colours | Implemented (Compose theme; compile-checked); visual contrast **Manual-only** | `ui/theme/Theme.kt`, `ui/components/Common.kt`, `ui/screens/HomeScreen.kt`, `ui/screens/ServerDetailScreen.kt` |
+
+Note: the 1.3.0 bug was architectural (the foreground service disposed the shared
+controller from `onDestroy()`), so the fix is covered by the pure decision helper
+plus compile checks; the actual service/notification behaviour and theme contrast
+are on the manual checklist in `docs/TESTING.md`.
+
 ## Memory
 
 | Requirement | Status | Where |
@@ -134,11 +150,13 @@ disabled.
 
 ## Not testable in this environment
 
-On-device FGS/Doze/swipe/notification rendering, SAF provider interactions,
-actual `exec()` from the app sandbox on a retail ROM, the real-network LAN paths
-(multicast announcement, AP/client isolation, Android 16/17 local-network
-consent), the Bedrock bridge's real LAN discovery/relay and the NetherNet direct
-path (need a Geyser server plus Bedrock clients of both generations, and Geyser's
-NetherNet native library on the phone): no device/emulator/ADB was available.
-`docs/TESTING.md` marks these as manual-only and provides the full checklist;
-the host-level integration evidence is in that file.
+On-device FGS/Doze/swipe/notification rendering, the real Stop → Start / Restart
+service transitions and stop timings, light/dark theme contrast and visual
+rendering, SAF provider interactions, actual `exec()` from the app sandbox on a
+retail ROM, the real-network LAN paths (multicast announcement, AP/client
+isolation, Android 16/17 local-network consent), the Bedrock bridge's real LAN
+discovery/relay and the NetherNet direct path (need a Geyser server plus Bedrock
+clients of both generations, and Geyser's NetherNet native library on the
+phone): no device/emulator/ADB was available. `docs/TESTING.md` marks these as
+manual-only and provides the full checklist; the host-level integration evidence
+is in that file.

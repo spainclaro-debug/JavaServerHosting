@@ -70,6 +70,40 @@ place.
   death the next cold start surfaces the persisted crash instead of pretending
   the server is still running.
 
+### Service lifecycle and stop/start semantics (1.4.0)
+
+The foreground service and the process-wide `ServerManager` have different
+lifetimes, and 1.4.0 makes that explicit (1.3.0 and earlier disposed the shared
+manager from `onDestroy()`, so a Stop made the next Start return “JavaHost is
+shutting down.” until the app process was killed):
+
+- **The manager is revivable.** `ServerManager.shutdown()` keeps its contract —
+  kill the child, cancel the coroutine scope, stop the console publisher — but
+  it no longer permanently ends the singleton. `start()`/`restart()` call
+  `ensureOperational()`, which recreates the scope and console publisher, clears
+  the disposed flag and resets the shutdown latch. `hasActiveSession()` reports
+  whether a child session really exists, independent of the published runtime
+  snapshot.
+- **Idle service teardown does not dispose it.** `onDestroy()` calls
+  `shutdown()` only when a session or active runtime exists. After a normal Stop
+  the service releases its locks/notification and stops; the controller stays
+  usable, so the next Start needs no app restart.
+- **Start during Stop queues.** `ServiceLifecycleDecisions.decideStart()` is a
+  pure, exhaustively unit-tested helper that returns one of `ADOPT_RUNNING`,
+  `QUEUE_AFTER_STOP`, `CLEAR_STALE_THEN_START` or `START_FRESH` from the
+  published runtime, its state and `hasActiveSession()`. A queued Start runs
+  immediately after the stop finishes in the same service operation, so the
+  notification moves from “Stopping…” to “Starting…” with no teardown between.
+- **Restart is one operation.** `ServiceLifecycleDecisions.decideRestart()` picks
+  `RESTART_EXISTING`, `CLEAR_STALE_THEN_START` or `START_FRESH`; a
+  `restartInFlight` guard makes the runtime observer ignore the transient
+  terminal state published during a restart, and the service waits (bounded) for
+  the new session to become active and stays alive for it.
+- **Stale-state recovery.** If the runtime claims active but
+  `hasActiveSession()` is false, the service calls `forceStop()` (clearing the
+  zombie session and resetting the runtime) and then starts fresh. The manual
+  Force Stop action remains for a genuinely stuck child.
+
 ## Directory layout
 
 Everything is app-private (`Context.filesDir`), so no `MANAGE_EXTERNAL_STORAGE`:
@@ -184,8 +218,11 @@ with `CRASHED` for an unexpected exit. On start it:
 - computes uptime, heap (`jcmd GC.heap_info`, falling back to `/proc/<pid>/status`
   RSS) and device free RAM every few seconds.
 
-Graceful stop sends `stop` to Minecraft servers and waits; generic servers are
-terminated after a short grace period because arbitrary JARs do not share a
+Graceful stop sends `stop` to Minecraft servers and allows up to
+`GRACEFUL_STOP_MAX_MS = 8 s` for the world save and exit, then `SIGTERM` with a
+`KILL_GRACE_MS = 2 s` grace, then `SIGKILL` (pid-level `Os.kill` plus the
+platform `Process` API) — worst case ~11 s, normally under 2 s. Generic servers
+are terminated after a short grace period because arbitrary JARs do not share a
 stop protocol. Unexpected exits are classified (OOM, port already in use,
 unsupported class version, missing library, EULA, signal 137 / system kill,
 unknown), written to `crashes/`, persisted on the instance, and surfaced in the
@@ -487,6 +524,27 @@ optional Minecraft EULA) → home (instance list, active-server card) → create
 stats, crash post-mortem) → console / files / server.properties / Modrinth
 plugins-mods. Generic instances hide Minecraft-only screens and instead expose
 the working-directory browser, raw JVM args and server args.
+
+### Theme palette (1.4.0)
+
+Two Material 3 schemes selected by the system dark-mode setting:
+
+- **Dark (unchanged):** ink background (`#0C1116`), teal accent (`#2BD4A8`) and
+  the previous surface/text greys.
+- **Light (new):** warm cream background `#F0E4C8`, surface `#F6ECD8` (lighter
+  so cards separate), brown **accent/primary `#5A4C39`**, cream `onPrimary`
+  `#F7EFDD`, primary container `#E7D9BE` with `onPrimaryContainer` `#3B3123`,
+  dark-brown `onBackground`/`onSurface` `#2E261B`, `surfaceVariant` `#E3D3B4`,
+  `onSurfaceVariant` `#5C4E3C`, secondary `#7A6A52`, outline `#9C8A6E` and the
+  standard error red `#B3261E` with white `onError`.
+- **Active-server accent:** `StatePill` for `RUNNING` uses
+  `MaterialTheme.colorScheme.primary`, so it is the brown accent in light mode
+  and teal in dark mode. `SectionCard` gained optional
+  `containerColor`/`borderColor` parameters (2 dp border when set, default call
+  sites unchanged), used by the active server card, the active instance card and
+  the active server's status card (`primaryContainer` + `primary` border). The
+  theme never hardcodes the light brown outside the light scheme, so dark mode
+  keeps its teal accent and every screen stays readable.
 
 ## Security & privacy
 

@@ -39,8 +39,7 @@ import dev.javahost.ui.components.SectionCard
 import dev.javahost.ui.components.Tag
 import dev.javahost.ui.components.formatBytes
 import dev.javahost.ui.components.formatTimestamp
-import dev.javahost.ui.theme.TealGreen
-import dev.javahost.ui.theme.WarnAmber
+import dev.javahost.ui.theme.javaHostStatusColors
 
 /**
  * Java runtime management. Runtimes are downloaded from Termux packages at the
@@ -248,9 +247,9 @@ private fun JreMajorCard(state: AppUiState, actions: AppActions, major: Int) {
         subtitle = if (isRecommended) "Recommended for most servers" else null,
         trailing = {
             Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                if (installation != null) Tag("Installed", TealGreen)
+                if (installation != null) Tag("Installed", javaHostStatusColors().success)
                 if (isDefault) Tag("Default")
-                if (job != null && job.state == JobState.RUNNING) Tag("Installing", WarnAmber)
+                if (job != null && job.state == JobState.RUNNING) Tag("Installing", javaHostStatusColors().warning)
             }
         }
     ) {

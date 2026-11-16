@@ -1,5 +1,80 @@
 # Changelog
 
+## 1.4.0 — 2026-11-16
+
+Fixes the “after Stop, Start does nothing until the app is closed” bug and adds
+a light theme.
+
+### Root cause — a stopped server could not be started again
+- `ForegroundServerService.onDestroy()` unconditionally called
+  `ServerManager.shutdown()`. The foreground service is destroyed after every
+  normal Stop, and `shutdown()` **permanently disposed the process-wide
+  singleton**: it set `disposed = true`, cancelled the coroutine scope and
+  latched `shutdownOnce`. The next Start returned
+  `StartResult.Rejected("JavaHost is shutting down.")` — the “shutting down”
+  notification — until the whole app process was killed and a fresh
+  `AppContainer`/`ServerManager` was created. That is why the user had to close
+  the app to start a server again.
+- Secondary bugs: a Start pressed while the runtime was `STOPPING` adopted the
+  dying server instead of queuing; `restartExclusive()` ended its service
+  operation immediately, so the runtime observer could see the transient
+  `STOPPED` published during a restart and tear the service down, killing the
+  JVM the restart had just launched; Stop was slow (20 s save + 3 s kill) and its
+  notification lingered; there was no queue for Start-during-Stop.
+
+### Fix — revivable manager and explicit service lifecycle
+- **`ServerManager` is revivable after service teardown.** `shutdown()` keeps its
+  contract (kill the child, release coroutines), but a later `start()`/
+  `restart()` calls `ensureOperational()`, which recreates the coroutine scope
+  and console publisher, clears the disposed flag and resets the shutdown latch.
+  New `hasActiveSession()` tells a real child session apart from a stale
+  published runtime snapshot.
+- **Idle service destruction no longer disposes the controller.**
+  `ForegroundServerService.onDestroy()` calls `shutdown()` only when a session or
+  active runtime actually exists; after a normal Stop it just releases the locks
+  and notification and leaves the process-wide manager usable.
+- **Start during Stop queues.** A pure `ServiceLifecycleDecisions.decideStart()`
+  helper classifies each Start command (adopt running, queue after STOPPING,
+  clear stale state then start, or start fresh). A queued Start runs immediately
+  after the stop in the same service operation, so the notification switches
+  from “Stopping…” to “Starting…” with no teardown in between.
+- **Restart stays one service operation.** A restart-in-flight guard makes the
+  runtime observer ignore the transient terminal state during a restart; the
+  service waits (bounded) for the new session to become active and stays alive,
+  so the Restart button cannot kill the JVM it just started.
+- **Fast, bounded stop.** Minecraft gets the `stop` command and up to **8 s** to
+  save and exit, then `SIGTERM` with a **2 s** grace, then `SIGKILL` escalation
+  (worst case ~11 s, normally under 2 s). The notification is removed as soon as
+  a terminal state is published, and Start works again immediately.
+- **Stale-state recovery.** If the published runtime claims active but
+  `hasActiveSession()` is false, the service calls `forceStop()` to clear the
+  zombie session and starts fresh; the manual **Force stop** action is retained
+  for a genuinely stuck child.
+
+### New light theme
+- **Light palette:** cream background `#F0E4C8`, brown accent `#5A4C39`, with a
+  readable on-colour set (cream `onPrimary`, dark-brown `onBackground`/
+  `onSurface`, a slightly lighter `surface` so cards separate).
+- **Dark theme unchanged** (ink/teal); the accent resolves to the dark palette's
+  teal there, so no light-mode brown is hardcoded.
+- **Active server accents:** active server cards and the `RUNNING` state pill use
+  the accent colour, and `SectionCard` gained optional container/border colours
+  for that treatment; inactive cards look the same as before.
+
+- 424 hermetic unit tests (new `ServiceLifecycleDecisionsTest` truth table for
+  start/restart decisions; exact count in the release build).
+- **Release note:** the 1.4.0 APK is signed with the same development key as
+  1.3.0, so it installs as an **in-place upgrade**; instances, worlds, plugins and
+  settings are preserved.
+
+### Notes
+- A JVM that ignores both `stop` and `SIGTERM` is SIGKILLed after ~10 s and can
+  lose the last few seconds of unsaved world data; the console says when that
+  happens. This is the trade-off that makes the notification clear quickly and
+  Start reliable.
+- Force Stop is only for a genuinely wedged child; normal Stop now always leaves
+  the app able to start another server.
+
 ## 1.3.0 — 2026-11-15
 
 Adds **Bedrock Edition LAN hosting**: with Geyser + Floodgate installed,

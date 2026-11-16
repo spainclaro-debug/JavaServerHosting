@@ -1,6 +1,7 @@
 package dev.javahost.ui.components
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -59,10 +60,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import dev.javahost.core.model.JobProgress
 import dev.javahost.core.model.RunState
-import dev.javahost.ui.theme.Danger
-import dev.javahost.ui.theme.InfoBlue
-import dev.javahost.ui.theme.TealGreen
-import dev.javahost.ui.theme.WarnAmber
+import dev.javahost.ui.theme.javaHostStatusColors
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -177,24 +175,33 @@ fun SectionCard(
     title: String? = null,
     subtitle: String? = null,
     trailing: @Composable RowScope.() -> Unit = {},
+    containerColor: Color = MaterialTheme.colorScheme.surface,
+    borderColor: Color? = null,
+    titleColor: Color = MaterialTheme.colorScheme.onSurface,
+    subtitleColor: Color = MaterialTheme.colorScheme.onSurfaceVariant,
     content: @Composable ColumnScope.() -> Unit
 ) {
+    val shape = RoundedCornerShape(16.dp)
     Card(
-        modifier = modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(16.dp),
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+        modifier = modifier
+            .fillMaxWidth()
+            .then(
+                if (borderColor != null) Modifier.border(2.dp, borderColor, shape) else Modifier
+            ),
+        shape = shape,
+        colors = CardDefaults.cardColors(containerColor = containerColor),
         elevation = CardDefaults.cardElevation(defaultElevation = 0.dp)
     ) {
         Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
             if (title != null) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Column(modifier = Modifier.weight(1f)) {
-                        Text(title, style = MaterialTheme.typography.titleMedium)
+                        Text(title, style = MaterialTheme.typography.titleMedium, color = titleColor)
                         if (subtitle != null) {
                             Text(
                                 subtitle,
                                 style = MaterialTheme.typography.bodyMedium,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                                color = subtitleColor
                             )
                         }
                     }
@@ -242,10 +249,11 @@ fun LabeledSlider(
     onValueChange: (Int) -> Unit
 ) {
     val steps = ((range.last - range.first) / step - 1).coerceAtLeast(0)
+    val valueColor = javaHostStatusColors().success
     Column {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Text(label, style = MaterialTheme.typography.bodyMedium, modifier = Modifier.weight(1f))
-            Text("$value $unit", style = MaterialTheme.typography.titleMedium, color = TealGreen)
+            Text("$value $unit", style = MaterialTheme.typography.titleMedium, color = valueColor)
         }
         Slider(
             value = value.toFloat(),
@@ -287,18 +295,32 @@ fun InfoRow(label: String, value: String, valueColor: Color = MaterialTheme.colo
 /* Status & feedback                                                           */
 /* -------------------------------------------------------------------------- */
 
+/**
+ * Small rounded status chip ("Running", "Stopping", …).
+ *
+ * @param colorOverride optional high-contrast colour for pills rendered on an accent
+ *   (`primaryContainer`) surface, such as the active-server cards. In dark mode the
+ *   accent RUNNING colour (TealGreen) is unreadable on the dark accent container, so
+ *   those call sites pass the same high-contrast colour as the card titles. When set,
+ *   the translucent chip fill is dropped so the colour keeps its full contrast against
+ *   the accent container. `null` keeps today's per-state colour for every other screen.
+ */
 @Composable
-fun StatePill(text: String, state: RunState) {
-    val (color, label) = when (state) {
-        RunState.RUNNING -> TealGreen to text
-        RunState.STARTING -> InfoBlue to text
-        RunState.STOPPING -> WarnAmber to text
-        RunState.CRASHED -> Danger to text
+fun StatePill(text: String, state: RunState, colorOverride: Color? = null) {
+    val status = javaHostStatusColors()
+    val (stateColor, label) = when (state) {
+        // RUNNING uses the theme primary so an active server reads as the accent
+        // in light mode (ink brown) and as TealGreen in dark mode.
+        RunState.RUNNING -> MaterialTheme.colorScheme.primary to text
+        RunState.STARTING -> status.info to text
+        RunState.STOPPING -> status.warning to text
+        RunState.CRASHED -> status.danger to text
         RunState.STOPPED -> MaterialTheme.colorScheme.onSurfaceVariant to text
     }
+    val color = colorOverride ?: stateColor
     Surface(
         shape = RoundedCornerShape(50),
-        color = color.copy(alpha = 0.15f)
+        color = if (colorOverride == null) color.copy(alpha = 0.15f) else Color.Transparent
     ) {
         Row(
             modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
@@ -330,7 +352,8 @@ fun Tag(text: String, color: Color = MaterialTheme.colorScheme.primary) {
 
 @Composable
 fun MessageBanner(text: String, isError: Boolean, onDismiss: (() -> Unit)? = null) {
-    val color = if (isError) Danger else InfoBlue
+    val status = javaHostStatusColors()
+    val color = if (isError) status.danger else status.info
     Surface(
         modifier = Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(12.dp),
@@ -446,7 +469,7 @@ fun ConfirmDialog(
             Button(
                 onClick = { onConfirm(); onDismiss() },
                 colors = if (destructive) {
-                    ButtonDefaults.buttonColors(containerColor = Danger)
+                    ButtonDefaults.buttonColors(containerColor = javaHostStatusColors().danger)
                 } else ButtonDefaults.buttonColors()
             ) { Text(confirmLabel) }
         },
@@ -456,10 +479,11 @@ fun ConfirmDialog(
 
 @Composable
 fun SuccessRow(text: String) {
+    val success = javaHostStatusColors().success
     Row(verticalAlignment = Alignment.CenterVertically) {
-        Icon(Icons.Default.CheckCircle, contentDescription = null, tint = TealGreen, modifier = Modifier.size(18.dp))
+        Icon(Icons.Default.CheckCircle, contentDescription = null, tint = success, modifier = Modifier.size(18.dp))
         Spacer(Modifier.width(8.dp))
-        Text(text, style = MaterialTheme.typography.bodyMedium, color = TealGreen)
+        Text(text, style = MaterialTheme.typography.bodyMedium, color = success)
     }
 }
 

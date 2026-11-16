@@ -65,6 +65,14 @@ interface ServerController {
      */
     fun probeLan(): Boolean = false
 
+    /**
+     * True while a child JVM session actually exists. This is deliberately
+     * independent of the published [runtime] state: after a lifecycle bug or an
+     * OEM process kill the runtime can be stale, and the foreground service uses
+     * this to distinguish "really running" from "stale snapshot".
+     */
+    fun hasActiveSession(): Boolean = false
+
     /** Called when the service is being destroyed; must not leave a JVM behind. */
     fun shutdown()
 

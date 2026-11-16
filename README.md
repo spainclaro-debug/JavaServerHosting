@@ -9,10 +9,10 @@ Built with Kotlin + Jetpack Compose. Target: **arm64-v8a, Android 8.0+ (API 26),
 no root**. The APK is intended for GitHub/F-Droid-style sideloading; see
 [Why targetSdk 28](docs/ARCHITECTURE.md#why-the-app-targets-api-28).
 
-> **Status:** functional MVP, buildable and tested. **419 hermetic unit tests
+> **Status:** functional MVP, buildable and tested. **424 hermetic unit tests
 > (0 failures, 3 environment-gated skips)**; debug and signed release APKs
-> are built. The current release is **1.3.0** (versionCode 10, Java Edition LAN +
-> Bedrock Edition LAN via Geyser); see [CHANGELOG.md](CHANGELOG.md). Minecraft
+> are built. The current release is **1.4.0** (versionCode 11, reliable
+> stop/start/restart + light theme); see [CHANGELOG.md](CHANGELOG.md). Minecraft
 > (Vanilla 1.20.4, Paper 1.20.4, Fabric 1.20.4), a generic Java server (WireMock)
 > and a purpose-built sample HTTP server were booted on an Android/bionic
 > OpenJDK 21 during development.
@@ -156,6 +156,16 @@ no root**. The APK is intended for GitHub/F-Droid-style sideloading; see
 ### Process persistence & forensics
 - Foreground service (`specialUse`) with a persistent notification: status,
   uptime, players, JVM heap, device RAM, **Stop** and **Restart** actions.
+- **Reliable Stop → Start / Restart:** the foreground service no longer disposes
+  the process-wide server manager when it goes idle, so stopping a server never
+  requires closing the app. Start pressed while “Stopping…” is showing is queued
+  and runs immediately after the stop, and Restart keeps one service operation so
+  it cannot kill the JVM it just started. Stale runtime state is recovered
+  automatically with an internal force-stop.
+- **Bounded stop:** a Minecraft server gets ~8 s to save and exit, then
+  `SIGTERM`, then a 2 s grace before `SIGKILL`; the notification clears as soon
+  as the server is down (normally under 2 s). The manual **Force stop** action
+  remains for a genuinely stuck child.
 - Partial `WakeLock` + `WifiLock` for the server lifetime.
 - Battery-optimization exemption flow and Android 12+ Phantom Process Killer
   guidance with deep links, copyable ADB commands and OEM-agnostic wording.
@@ -173,6 +183,14 @@ no root**. The APK is intended for GitHub/F-Droid-style sideloading; see
   files, import/export through SAF, rename, delete, create folders, path-traversal
   safe.
 - The working directory is app-private; no `MANAGE_EXTERNAL_STORAGE` is needed.
+
+### Look & feel (1.4.0)
+- **New light theme:** a warm cream background (`#F0E4C8`) with a brown accent
+  (`#5A4C39`); cards use a slightly lighter cream so they separate, and all text
+  stays dark-brown/readable. **Dark mode is unchanged** (ink/teal).
+- **Active-server accent:** the active server card, its `RUNNING` state pill and
+  the active server's status card use the accent colour, while inactive cards
+  look the same as before.
 
 ### First-run wizard
 Device summary → Java runtime install → notification permission → battery
@@ -197,7 +215,7 @@ exemption → Phantom Process Killer guidance → optional Minecraft EULA → do
 
 ```bash
 # JDK 17+ and Android SDK 34 required.
-./gradlew :app:testDebugUnitTest   # 419 hermetic tests
+./gradlew :app:testDebugUnitTest   # 424 hermetic tests
 ./gradlew :app:assembleDebug       # app/build/outputs/apk/debug/app-debug.apk
 ./gradlew :app:assembleRelease     # unsigned; sign with apksigner for distribution
 ```
@@ -274,6 +292,10 @@ Unit tests (all hermetic, no network/device):
    server pong (Mojang bug MCPE-239883). On Android/bionic Geyser's NetherNet
    native library may not load. Console Bedrock builds vary in what they show;
    the LAN card's manual addresses are the reliable fallback.
+10. **Stop is bounded.** A server JVM that ignores both `stop` and `SIGTERM` for
+    ~10 s is `SIGKILL`ed; the console says so and the last few seconds of unsaved
+    world changes can be lost. This is deliberate — it keeps Stop fast and lets
+    Start work again without restarting the app.
 
 Also: aarch64 only; no root; one child JVM at a time; first Paper boot downloads
 its libraries and can take a while; JNA warnings may still appear on some server
@@ -281,19 +303,19 @@ versions even though the server runs.
 
 ## Troubleshooting
 
-- Stop/restart stuck at “Shutting down…”
+- Stop → Start did nothing until the app was restarted (fixed in 1.4.0)
+- Stop still stuck / server will not die
 - Plugins (Geyser/Floodgate/ViaVersion) installed but not loading
 - Server does not appear in Minecraft / other devices cannot connect
 - Bedrock clients cannot see or join the server (LAN/Friends)
 - Server visible in Minecraft but join fails
 
 See [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md) for the server-flavor /
-loader matrix, the LAN card and join checklists. JavaHost 1.3.0 adds the Bedrock
-LAN bridge on top of the 1.2.0 LAN work (correct LAN address resolution, a TCP
-reachability self-test and Minecraft LAN discovery); JavaHost 1.1.2 also hardens
-the stop path and prints a per-start diagnostic with the server type and
-plugin/mod counts. v1.3.0 is an **in-place upgrade of 1.2.0** (same signing key),
-so settings, instances and worlds are kept.
+loader matrix, the LAN card and join checklists. JavaHost 1.4.0 makes Stop →
+Start work without closing the app (revivable manager, queued start, one-operation
+restart, bounded stop) and adds the light theme; 1.3.0 added the Bedrock LAN
+bridge on top of the 1.2.0 LAN work. v1.4.0 is an **in-place upgrade of 1.3.0**
+(same signing key), so settings, instances and worlds are kept.
 
 ## Project layout
 
@@ -307,7 +329,7 @@ app/src/main/java/dev/javahost/
   core/launch/       ProcessBuilder command building + arg tokenizer
   core/net/          LAN address selection, discovery announcers, Bedrock bridge
   core/server/       ServerManager, console/log/crash/heap/JNA helpers
-  core/service/      ForegroundServerService + notifications
+  core/service/      ForegroundServerService, lifecycle decisions + notifications
   core/system/       powermanagement, memory advisor, silent media, guides
   core/modrinth/     Modrinth API v2 client
   ui/                Compose screens, ViewModel, hand-rolled navigation

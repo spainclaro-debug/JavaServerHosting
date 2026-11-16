@@ -56,9 +56,7 @@ import dev.javahost.ui.components.ScreenScaffold
 import dev.javahost.ui.components.SectionCard
 import dev.javahost.ui.components.SuccessRow
 import dev.javahost.ui.components.readableMessage
-import dev.javahost.ui.theme.InfoBlue
-import dev.javahost.ui.theme.TealGreen
-import dev.javahost.ui.theme.WarnAmber
+import dev.javahost.ui.theme.javaHostStatusColors
 import kotlinx.coroutines.launch
 
 private const val EULA_URL = "https://aka.ms/MinecraftEULA"
@@ -295,7 +293,7 @@ fun PropertiesScreen(
                 Surface(
                     modifier = Modifier.fillMaxWidth(),
                     shape = MaterialTheme.shapes.small,
-                    color = InfoBlue.copy(alpha = 0.10f)
+                    color = javaHostStatusColors().info.copy(alpha = 0.10f)
                 ) {
                     Row(
                         modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
@@ -304,7 +302,7 @@ fun PropertiesScreen(
                         Icon(
                             Icons.Default.Info,
                             contentDescription = null,
-                            tint = InfoBlue,
+                            tint = javaHostStatusColors().info,
                             modifier = Modifier.size(16.dp)
                         )
                         Spacer(Modifier.width(8.dp))
@@ -351,7 +349,7 @@ fun PropertiesScreen(
                                 "your network will not be able to connect. Leave the field empty so the " +
                                 "server listens on all interfaces.",
                             style = MaterialTheme.typography.labelSmall,
-                            color = WarnAmber
+                            color = javaHostStatusColors().warning
                         )
                     }
                     LabeledField(

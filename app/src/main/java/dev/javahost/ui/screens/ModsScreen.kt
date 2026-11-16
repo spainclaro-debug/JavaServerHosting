@@ -69,9 +69,7 @@ import dev.javahost.ui.components.ScreenScaffold
 import dev.javahost.ui.components.Tag
 import dev.javahost.ui.components.formatBytes
 import dev.javahost.ui.components.readableMessage
-import dev.javahost.ui.theme.InfoBlue
-import dev.javahost.ui.theme.TealGreen
-import dev.javahost.ui.theme.WarnAmber
+import dev.javahost.ui.theme.javaHostStatusColors
 import kotlinx.coroutines.launch
 import java.util.Locale
 
@@ -472,7 +470,7 @@ fun ModsScreen(
                             Text(
                                 "The server is running; installed files are picked up after a restart.",
                                 style = MaterialTheme.typography.labelSmall,
-                                color = WarnAmber
+                                color = javaHostStatusColors().warning
                             )
                         }
                     }
@@ -543,14 +541,14 @@ private fun SurfaceNote(text: String) {
         modifier = Modifier
             .fillMaxWidth()
             .clip(RoundedCornerShape(10.dp))
-            .background(InfoBlue.copy(alpha = 0.10f))
+            .background(javaHostStatusColors().info.copy(alpha = 0.10f))
             .padding(horizontal = 10.dp, vertical = 8.dp)
     ) {
         Row(verticalAlignment = Alignment.Top) {
             Icon(
                 Icons.Default.Info,
                 contentDescription = null,
-                tint = InfoBlue,
+                tint = javaHostStatusColors().info,
                 modifier = Modifier.size(15.dp)
             )
             Spacer(Modifier.width(8.dp))
@@ -574,7 +572,7 @@ private fun InstalledFileRow(entry: FileEntry) {
         Icon(
             Icons.Default.CheckCircle,
             contentDescription = null,
-            tint = TealGreen,
+            tint = javaHostStatusColors().success,
             modifier = Modifier.size(16.dp)
         )
         Spacer(Modifier.width(8.dp))
@@ -652,7 +650,7 @@ private fun ProjectCard(
                 }
                 Tag(
                     text = if (project.projectType == "mod") "mod" else "plugin",
-                    color = if (project.projectType == "mod") TealGreen else InfoBlue
+                    color = if (project.projectType == "mod") javaHostStatusColors().success else javaHostStatusColors().info
                 )
             }
             Text(

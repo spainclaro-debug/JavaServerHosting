@@ -1,5 +1,12 @@
 # Troubleshooting
 
+## Upgrading from 1.3.0
+
+The JavaHost 1.4.0 APK is signed with the same development key as 1.3.0 and
+installs as an **in-place upgrade**: server instances, worlds, plugins, the
+installed JRE and settings are kept. Nothing needs to be migrated. The new light
+theme follows the system dark-mode setting; dark mode looks the same as before.
+
 ## Upgrading from 1.2.0
 
 The JavaHost 1.3.0 APK is signed with the same development key as 1.2.0 and
@@ -22,26 +29,47 @@ update; back up the instance working directories before uninstalling.
 
 ## “Stopping the server never finishes / notification keeps saying Shutting down”
 
-Fixed in **1.1.2/1.1.3**, but here is how the stop path works and what to do if it
-happens again:
+Fixed for good in **1.4.0** (on top of the 1.1.2/1.1.3 hardening). How Stop works
+now:
 
-1. The app sends `stop` to the Minecraft console, then waits up to 20 s for a
-   clean world save. If the JVM does not exit, it sends `SIGTERM`, then
-   `SIGKILL` (including a direct pid-level kill) and finally force-resets the
-   session so the notification cannot loop forever.
-2. The “Shutting down…” notification is shown once; it is no longer re-posted
-   every 2 seconds while stopping.
-3. If the server still refuses to die, the app posts a **“Server stop forced”**
-   alert and clears the foreground service. Check the console for a stuck
-   save/shutdown hook and try again.
-4. If the app process itself is killed by the ROM mid-stop, Android may leave
-   the child JVM orphaned. Keep the battery-optimization exemption and follow
-   the Phantom Process Killer guide.
-5. **False crash after a normal stop** (“Server exited unexpectedly: A required
-   class or native library is missing”, exit code 0) was a classification bug:
-   shutdown warnings in the console tail were being treated as the cause of
-   death. 1.1.3 treats exit code 0 as a normal/expected exit and sets the
-   stop flag synchronously, so this report no longer appears after Stop.
+1. Stop sends `stop` to a Minecraft server and allows up to **8 s** for the world
+   save and exit. If the JVM is still alive it gets `SIGTERM`, then a **2 s**
+   grace, then `SIGKILL` (including a direct PID-level kill) and the session is
+   force-reset. A normal stop finishes well under 2 s; the worst case is ~11 s.
+2. The “Shutting down…” notification is posted once and removed as soon as the
+   server publishes a terminal state — no lingering notification.
+3. **You can press Start immediately.** A Start pressed while the app is still
+   stopping is queued and starts the server as soon as the stop finishes, in the
+   same foreground service, so the notification switches from “Stopping…” to
+   “Starting…”. You no longer need to wait, retry or close the app.
+4. **Restart is safe:** it keeps one service operation and cannot tear down the
+   JVM it just started.
+5. If the runtime looks active but the child session is gone (stale state after a
+   ROM kill), the app clears it automatically with an internal force-stop and
+   starts fresh.
+
+**If it still happens on 1.4.0+:**
+
+- Tap **Force stop** on the server screen or in the ongoing notification: it
+  kills the child by PID and clears the session without killing the whole app.
+  Use it only when a stop is genuinely wedged (the console shows a stuck
+  save/shutdown hook) — normal Stop/Start and Restart recover on their own, and
+  Force stop is no longer needed to “reset” the app.
+- If Start says **“JavaHost is shutting down.”**, that should not happen in
+  1.4.0 — it is the 1.3.0-and-earlier service-teardown bug. Export the console
+  (`Console → Export`) and report it; closing and reopening the app still
+  recovers the state, but should not be necessary.
+- If the app process itself is killed by the ROM mid-stop, Android may leave the
+  child JVM orphaned. Keep the battery-optimization exemption and follow the
+  Phantom Process Killer guide; the next launch recovers the stale runtime.
+- A JVM that ignores both `stop` and `SIGTERM` is killed with `SIGKILL` after
+  ~10 s, so the last few seconds of unsaved world data can be lost. The console
+  says when a stop escalates to a kill.
+- **False crash after a normal stop** (“Server exited unexpectedly: A required
+  class or native library is missing”, exit code 0) was a classification bug:
+  shutdown warnings in the console tail were being treated as the cause of
+  death. 1.1.3 treats exit code 0 as a normal/expected exit and sets the stop
+  flag synchronously, so this report no longer appears after Stop.
 
 ## “I installed Geyser / Floodgate / ViaVersion but they are not loading”
 
@@ -291,10 +319,12 @@ servers. If you are on an older build, update JavaHost.
 
 ## “Stop is stuck / I had to force-stop the app”
 
-Use **Force stop** on the server screen (1.1.5) or the **Force stop** action on
-the ongoing notification. This kills the JVM by PID and clears the session
-without killing the whole app. See the stop section above for the normal
-escalation path.
+See **“Stopping the server never finishes / notification keeps saying Shutting
+down”** above for how Stop works in 1.4.0. **Force stop** on the server screen
+or the ongoing notification kills the JVM by PID and clears the session without
+killing the whole app; in 1.4.0 it is only needed for a genuinely wedged child.
+A normal Stop leaves the app able to Start again immediately, and Restart
+recovers on its own — no app restart is required.
 
 ## “The server appears in my Minecraft server list but I cannot join”
 

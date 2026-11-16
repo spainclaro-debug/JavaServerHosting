@@ -26,9 +26,7 @@ import dev.javahost.ui.components.ScreenContent
 import dev.javahost.ui.components.ScreenScaffold
 import dev.javahost.ui.components.SectionCard
 import dev.javahost.ui.components.SuccessRow
-import dev.javahost.ui.theme.Danger
-import dev.javahost.ui.theme.TealGreen
-import dev.javahost.ui.theme.WarnAmber
+import dev.javahost.ui.theme.javaHostStatusColors
 
 private const val DONT_KILL_MY_APP_URL = "https://dontkillmyapp.com"
 
@@ -58,12 +56,12 @@ fun PowerGuideScreen(state: AppUiState, actions: AppActions, onBack: () -> Unit)
                 if (batteryExempt) {
                     SuccessRow("Battery optimization exemption is active")
                 } else {
-                    InfoRow("Battery optimization", "Not exempt", Danger)
+                    InfoRow("Battery optimization", "Not exempt", javaHostStatusColors().danger)
                 }
                 InfoRow(
                     "Notifications",
                     if (notificationsGranted) "Allowed" else "Blocked",
-                    if (notificationsGranted) TealGreen else Danger
+                    if (notificationsGranted) javaHostStatusColors().success else javaHostStatusColors().danger
                 )
                 InfoRow("Android API", state.power.androidSdk.toString())
                 InfoRow(
@@ -133,7 +131,7 @@ fun PowerGuideScreen(state: AppUiState, actions: AppActions, onBack: () -> Unit)
                         state.power.mediaHackSettingEnabled -> "Enabled in settings"
                         else -> "Available but off"
                     },
-                    if (state.power.mediaHackFeatureEnabled) TealGreen else WarnAmber
+                    if (state.power.mediaHackFeatureEnabled) javaHostStatusColors().success else javaHostStatusColors().warning
                 )
                 Text(
                     "Configure it under Settings → Advanced. It is never required to run a server.",

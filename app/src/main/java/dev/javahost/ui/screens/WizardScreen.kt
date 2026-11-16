@@ -56,8 +56,7 @@ import dev.javahost.ui.components.SuccessRow
 import dev.javahost.ui.components.Tag
 import dev.javahost.ui.components.formatBytes
 import dev.javahost.ui.components.formatMegabytes
-import dev.javahost.ui.theme.TealGreen
-import dev.javahost.ui.theme.WarnAmber
+import dev.javahost.ui.theme.javaHostStatusColors
 
 private const val MINECRAFT_EULA_URL = "https://aka.ms/MinecraftEULA"
 
@@ -136,7 +135,7 @@ fun WizardScreen(state: AppUiState, actions: AppActions, onFinished: () -> Unit)
                             Text(
                                 "Accept the Minecraft EULA above to continue.",
                                 style = MaterialTheme.typography.labelSmall,
-                                color = WarnAmber
+                                color = javaHostStatusColors().warning
                             )
                         }
                     }
@@ -239,7 +238,7 @@ private fun WelcomeStep(state: AppUiState, actions: AppActions) {
             }
             Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                 Tag("Minecraft: first-class")
-                Tag("Other Java servers: experimental", WarnAmber)
+                Tag("Other Java servers: experimental", javaHostStatusColors().warning)
             }
             Text(
                 "You can change this later in Settings. Setup can be finished later too — every step is available from Settings.",
@@ -541,7 +540,7 @@ private fun DoneStep(state: AppUiState) {
     Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
         Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
-                Icon(Icons.Default.Check, contentDescription = null, tint = TealGreen, modifier = Modifier.size(28.dp))
+                Icon(Icons.Default.Check, contentDescription = null, tint = javaHostStatusColors().success, modifier = Modifier.size(28.dp))
                 Spacer(Modifier.width(8.dp))
                 Text("JavaHost is ready", style = MaterialTheme.typography.headlineSmall)
             }

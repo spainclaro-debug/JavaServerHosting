@@ -73,9 +73,7 @@ import dev.javahost.ui.components.ScreenScaffold
 import dev.javahost.ui.components.formatBytes
 import dev.javahost.ui.components.formatTimestamp
 import dev.javahost.ui.components.readableMessage
-import dev.javahost.ui.theme.Danger
-import dev.javahost.ui.theme.TealGreen
-import dev.javahost.ui.theme.WarnAmber
+import dev.javahost.ui.theme.javaHostStatusColors
 import kotlinx.coroutines.launch
 
 private data class FilesNotice(val text: String, val isError: Boolean = false)
@@ -416,7 +414,7 @@ private fun FileBreadcrumbs(
             Text(
                 text = "Root",
                 fontSize = 12.sp,
-                color = if (currentDir.isEmpty()) TealGreen else MaterialTheme.colorScheme.onSurface
+                color = if (currentDir.isEmpty()) javaHostStatusColors().success else MaterialTheme.colorScheme.onSurface
             )
         }
         segments.forEachIndexed { index, segment ->
@@ -434,7 +432,7 @@ private fun FileBreadcrumbs(
                 Text(
                     text = segment.ifBlank { rootLabel },
                     fontSize = 12.sp,
-                    color = if (index == segments.lastIndex) TealGreen
+                    color = if (index == segments.lastIndex) javaHostStatusColors().success
                     else MaterialTheme.colorScheme.onSurface
                 )
             }
@@ -447,7 +445,7 @@ private fun FilesWarningStrip(running: Boolean) {
     Surface(
         modifier = Modifier.fillMaxWidth(),
         shape = MaterialTheme.shapes.small,
-        color = WarnAmber.copy(alpha = 0.10f)
+        color = javaHostStatusColors().warning.copy(alpha = 0.10f)
     ) {
         Row(
             modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
@@ -456,7 +454,7 @@ private fun FilesWarningStrip(running: Boolean) {
             Icon(
                 Icons.Default.Warning,
                 contentDescription = null,
-                tint = WarnAmber,
+                tint = javaHostStatusColors().warning,
                 modifier = Modifier.size(15.dp)
             )
             Spacer(Modifier.width(6.dp))
@@ -493,7 +491,7 @@ private fun FileRow(
             Icon(
                 imageVector = if (entry.isDirectory) Icons.Default.List else Icons.Default.Edit,
                 contentDescription = null,
-                tint = if (entry.isDirectory) TealGreen
+                tint = if (entry.isDirectory) javaHostStatusColors().success
                 else MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.size(20.dp)
             )
@@ -548,7 +546,7 @@ private fun FileRow(
                             Icon(
                                 Icons.Default.Delete,
                                 contentDescription = null,
-                                tint = Danger
+                                tint = javaHostStatusColors().danger
                             )
                         }
                     )

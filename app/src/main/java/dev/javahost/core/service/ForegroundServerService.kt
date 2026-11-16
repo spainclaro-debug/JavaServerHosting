@@ -46,6 +46,13 @@ import java.util.concurrent.atomic.AtomicBoolean
  *  - release everything - locks, notification, silent media, child JVM - on
  *    every exit path (stop, crash, rejection, task removal is ignored on
  *    purpose, service destruction).
+ *  - never dispose the process-wide controller on *idle* teardown: the manager
+ *    is revivable, so a later Start must work without restarting the app
+ *    process. The historic bug was an unconditional
+ *    `container.server.shutdown()` in [onDestroy]: every normal Stop destroyed
+ *    the service, `shutdown()` permanently disposed the singleton and the next
+ *    Start was rejected with "JavaHost is shutting down." until the process was
+ *    killed. The controller is only shut down here when a server is still alive.
  *
  * The service never starts the child JVM itself; it asks
  * `container.server.start(instanceId)` and reacts to the observed runtime
@@ -88,6 +95,23 @@ class ForegroundServerService : Service() {
     private var pendingCommand: (() -> Unit)? = null
     private val finishing = AtomicBoolean(false)
 
+    /**
+     * True while a [restartExclusive] operation owns the runtime. The STOPPED
+     * state published between the stop and start halves of a restart is
+     * transient; treating it as "finished" is the old Restart bug that made the
+     * observer tear the service (and the process-wide manager) down mid-restart.
+     */
+    @Volatile
+    private var restartInFlight = false
+
+    /**
+     * Start command that arrived while the previous server was still STOPPING.
+     * [beginStart] defers it and the running stop operation starts it as soon as
+     * the runtime is terminal, without tearing the service down in between.
+     */
+    @Volatile
+    private var pendingStartInstanceId: String? = null
+
     /* ------------------------------------------------------------------ */
     /* Lifecycle                                                          */
     /* ------------------------------------------------------------------ */
@@ -111,6 +135,9 @@ class ForegroundServerService : Service() {
             foregroundPosted = false
             runtimeObserver = null
             tickerJob = null
+            // The previous service generation is gone: a command it still had
+            // queued behind a failing operation must never run in this one.
+            pendingCommand = null
             cancelAutoRestart()
         }
 
@@ -146,6 +173,18 @@ class ForegroundServerService : Service() {
 
     override fun onBind(intent: Intent?): IBinder? = null
 
+    /**
+     * Releases the service's resources, and shuts the process-wide controller
+     * down **only when a server is actually alive**.
+     *
+     * This distinction is load-bearing: the foreground service is destroyed
+     * after every normal Stop, and `ServerController.shutdown()` disposes the
+     * singleton ([dev.javahost.core.server.ServerManager] sets `disposed`,
+     * cancels its scope and latches `shutdownOnce`). Calling it unconditionally
+     * used to poison every later Start with "JavaHost is shutting down." until
+     * the whole app process was killed. When idle, the controller is intentionally
+     * left usable for the next foreground-service instance.
+     */
     override fun onDestroy() {
         finishing.set(true)
         cancelAutoRestart()
@@ -154,9 +193,21 @@ class ForegroundServerService : Service() {
         serviceScope?.cancel()
         runtimeObserver = null
         tickerJob = null
+        pendingCommand = null
+        pendingStartInstanceId = null
+        restartInFlight = false
         runCatching { silentMedia.stop() }
         runCatching { wakeLocks.release() }
-        runCatching { container.server.shutdown() }
+        // A child JVM still alive (system-initiated destruction, crash alert
+        // while running, app shutdown) must never be left behind; an idle
+        // teardown must not dispose the manager.
+        val sessionActive = runCatching { container.server.hasActiveSession() }.getOrDefault(false)
+        val runtimeActive = runCatching { container.server.runtime.value.isActive }.getOrDefault(false)
+        if (sessionActive || runtimeActive) {
+            runCatching { container.server.shutdown() }
+        } else {
+            Log.i(TAG, "Service destroyed while idle; keeping the process-wide controller usable")
+        }
         // Belt and braces: whether we stopped ourselves (normal stop, crash
         // alert, failed auto-restart) or the system destroyed us, never leave
         // the ongoing foreground notification behind. Alerts stay cancellable
@@ -171,91 +222,204 @@ class ForegroundServerService : Service() {
     /* Actions                                                            */
     /* ------------------------------------------------------------------ */
 
-    private fun beginStart(instanceId: String) {
-        // A deliberate manual start always begins a fresh crash-loop budget.
+    /**
+     * Bookkeeping shared by every deliberate manual start: a Start tap and the
+     * start that runs right after a queued Start-during-Stop. It opens a fresh
+     * crash-loop budget, clears the "user asked to stop" flag, cancels pending
+     * automatic restarts/alerts and adopts the requested instance id.
+     */
+    private fun prepareManualStart(instanceId: String) {
         autoRestartAttempts = 0
         manualStopRequested = false
         cancelAutoRestart()
         notifications.cancelAlert()
         currentInstanceId = instanceId
-        val existing = runCatching { container.server.runtime.value }.getOrNull()
-        if (existing?.isActive == true) {
-            // Do not spawn a second JVM; adopt the running one.
-            adopt(existing)
-            return
-        }
-        dispatchExclusive { startExclusive(instanceId) }
     }
 
-    private fun startExclusive(instanceId: String) {
-        startObserving()
-        postStatus(force = true)
+    private fun beginStart(instanceId: String) {
+        // Capture before the bookkeeping clears it: a Stop issued a split second
+        // ago must still be treated as a stop in progress below.
+        val stopWasRequested = manualStopRequested
+        prepareManualStart(instanceId)
+
+        val status = currentRuntime()
+        val decision = ServiceLifecycleDecisions.decideStart(
+            runtimeIsActive = status?.isActive == true,
+            runtimeState = status?.state,
+            hasSession = hasActiveSession()
+        )
+        when (decision) {
+            StartDecision.ADOPT_RUNNING -> {
+                // A Stop may have been issued a split second ago while the runtime
+                // still reads RUNNING (STOPPING is published asynchronously). Queue
+                // the start so it is not lost when the stop wins. A restart in
+                // flight already brings the server back, so it must NOT queue: a
+                // stale queued id would otherwise be consumed by a later Stop and
+                // restart the server unexpectedly.
+                if (stopWasRequested) {
+                    pendingStartInstanceId = instanceId
+                    Log.i(TAG, "Stop in progress; queued start of $instanceId until it finishes")
+                } else {
+                    // Do not spawn a second JVM; adopt the running one.
+                    status?.let { adopt(it) }
+                }
+            }
+            StartDecision.QUEUE_AFTER_STOP -> {
+                // Start pressed while the previous server is still stopping. The
+                // running stop operation starts this instance as soon as the
+                // runtime is terminal - no service teardown in between.
+                pendingStartInstanceId = instanceId
+                Log.i(TAG, "Stop in progress; queued start of $instanceId until it finishes")
+                if (!operationInProgress.get()) {
+                    // The STOPPING state was published outside this service's stop
+                    // operation (e.g. by a stale teardown). Drive the stop to
+                    // completion so the queued start cannot be stranded.
+                    dispatchExclusive { stopExclusive(force = false) }
+                }
+            }
+            StartDecision.CLEAR_STALE_THEN_START -> {
+                // The runtime claims to be active but no child JVM exists: clear
+                // the zombie snapshot, then start fresh.
+                dispatchExclusive { clearStaleAndStartExclusive(instanceId) }
+            }
+            StartDecision.START_FRESH -> dispatchExclusive { startExclusive(instanceId) }
+        }
+    }
+
+    /** What [startServer] did, so callers can keep the notification/auto-restart flow. */
+    private enum class StartOutcome {
+        STARTED,
+
+        /** Rejection/crash already reported and the service already finished. */
+        REJECTED,
+
+        /** The controller said Ok but the child was already gone; caller decides. */
+        EXITED_IMMEDIATELY
+    }
+
+    /** Spawns [instanceId] with no previous runtime to clear. */
+    private fun startExclusive(instanceId: String) =
+        runStartOperation(instanceId, clearStaleFirst = false)
+
+    /** Clears a zombie "active" runtime, then spawns [instanceId]. */
+    private fun clearStaleAndStartExclusive(instanceId: String) =
+        runStartOperation(instanceId, clearStaleFirst = true)
+
+    /**
+     * Runs a start inside the current exclusive operation and releases the
+     * operation in `finally`; a command queued while it ran is dispatched by
+     * [finishOperation].
+     */
+    private fun runStartOperation(instanceId: String, clearStaleFirst: Boolean) {
         scope().launch {
             try {
-                wakeLocks.acquire()
-                val result = withContext(Dispatchers.IO) {
-                    runCatching { container.server.start(instanceId) }
-                }
-                result.onFailure { error ->
-                    Log.e(TAG, "Server start threw", error)
-                    wakeLocks.release()
-                    silentMedia.stop()
-                    notifications.postStartRejected(
-                        error.message ?: "The server could not be started.",
-                        instanceName(instanceId),
-                        contentIntent(instanceId),
-                        restartServiceIntent(instanceId)
-                    )
-                    finishService()
-                }.onSuccess { startResult ->
-                    when (startResult) {
-                        is StartResult.Ok -> {
-                            sawActiveRuntime = true
-                            silentMedia.start()
-                            postStatus(force = true)
-                            // The child can exit between start() returning and
-                            // the observer's first collect; handle that race so
-                            // a crash never leaves a stale "Starting" FGS behind.
-                            val status = runCatching { container.server.runtime.value }.getOrNull()
-                            if (status != null && !status.isActive) handleFinished(status)
-                        }
-                        is StartResult.Rejected -> {
-                            val current = runCatching { container.server.runtime.value }.getOrNull()
-                            if (current?.isActive == true) {
-                                // A concurrent (auto) restart won the race: adopt
-                                // it instead of tearing down a live server.
-                                adopt(current)
-                            } else {
-                                wakeLocks.release()
-                                silentMedia.stop()
-                                notifications.postStartRejected(
-                                    startResult.message,
-                                    instanceName(instanceId),
-                                    contentIntent(instanceId),
-                                    restartServiceIntent(instanceId)
-                                )
-                                finishService()
-                            }
-                        }
-                    }
-                }
+                if (clearStaleFirst) clearStaleRuntime()
+                handleStartOutcome(startServer(instanceId))
             } finally {
                 finishOperation()
             }
         }
     }
 
+    /** Best-effort removal of a runtime that claims to be active without a session. */
+    private suspend fun clearStaleRuntime() {
+        withContext(Dispatchers.IO) {
+            runCatching { container.server.forceStop() }
+                .onFailure { Log.w(TAG, "Could not clear the stale server session", it) }
+        }
+        withTimeoutOrNull(STALE_CLEAR_WAIT_MS) {
+            container.server.runtime.first { !it.isActive }
+        }
+    }
+
+    /**
+     * Spawns [instanceId] and keeps notifications/locks in sync.
+     *
+     * Rejections are reported and finish the service here (same as before). A
+     * successful start whose runtime is already terminal is returned as
+     * [StartOutcome.EXITED_IMMEDIATELY] so a normal Start can run the crash
+     * post-mortem while a Restart can report the restart as failed.
+     */
+    private suspend fun startServer(instanceId: String): StartOutcome {
+        startObserving()
+        postStatus(force = true)
+        wakeLocks.acquire()
+        val result = withContext(Dispatchers.IO) {
+            runCatching { container.server.start(instanceId) }
+        }
+        val startResult = result.getOrElse { error ->
+            Log.e(TAG, "Server start threw", error)
+            val current = currentRuntime()
+            if (current?.isActive == true) {
+                // A concurrent (auto) restart won the race: adopt it instead of
+                // tearing down a live server.
+                adopt(current)
+                return StartOutcome.STARTED
+            }
+            rejectStart(instanceId, error.message ?: "The server could not be started.")
+            return StartOutcome.REJECTED
+        }
+        return when (startResult) {
+            is StartResult.Ok -> {
+                sawActiveRuntime = true
+                silentMedia.start()
+                postStatus(force = true)
+                // The child can exit between start() returning and the observer's
+                // first collect; report that race instead of leaving a stale
+                // "Starting" foreground service behind.
+                val status = currentRuntime()
+                if (status == null || status.isActive) StartOutcome.STARTED
+                else StartOutcome.EXITED_IMMEDIATELY
+            }
+            is StartResult.Rejected -> {
+                val current = currentRuntime()
+                if (current?.isActive == true) {
+                    adopt(current)
+                    StartOutcome.STARTED
+                } else {
+                    rejectStart(instanceId, startResult.message)
+                    StartOutcome.REJECTED
+                }
+            }
+        }
+    }
+
+    private fun rejectStart(instanceId: String?, message: String) {
+        wakeLocks.release()
+        silentMedia.stop()
+        notifications.postStartRejected(
+            message,
+            instanceName(instanceId),
+            contentIntent(instanceId),
+            restartServiceIntent(instanceId)
+        )
+        finishService()
+    }
+
+    private fun handleStartOutcome(outcome: StartOutcome) {
+        when (outcome) {
+            StartOutcome.STARTED, StartOutcome.REJECTED -> Unit
+            StartOutcome.EXITED_IMMEDIATELY -> {
+                val status = currentRuntime()
+                if (status != null) handleFinished(status) else finishService()
+            }
+        }
+    }
+
     private fun beginStop(force: Boolean) {
         // A manual stop is final: cancel any pending auto-restart, and make sure
-        // a crash that races with this stop cannot schedule another one.
+        // a crash that races with this stop cannot schedule another one. An
+        // explicit Stop also cancels a Start that was queued behind a stop.
         manualStopRequested = true
         cancelAutoRestart()
+        pendingStartInstanceId = null
         dispatchExclusive { stopExclusive(force) }
     }
 
     private fun stopExclusive(force: Boolean) {
-        val wasActive = runCatching { container.server.runtime.value.isActive }.getOrDefault(false)
-        val targetId = runCatching { container.server.runtime.value.instanceId }.getOrNull()
+        val runtime = currentRuntime()
+        val wasActive = runtime?.isActive == true
+        val targetId = runtime?.instanceId
         if (wasActive) sawActiveRuntime = true
         startObserving()
         postStatus(force = true)
@@ -271,23 +435,26 @@ class ForegroundServerService : Service() {
                 // Wait for the controller to actually publish STOPPED/CRASHED.
                 // Checking immediately after stop() is useless because stop() is
                 // asynchronous: it only published STOPPING, which used to leave
-                // the FGS notification looping on "Shutting down…" forever.
-                val stopped = withTimeoutOrNull(if (force) 15_000L else 40_000L) {
+                // the FGS notification looping on "Shutting down…" forever. The
+                // caps match the manager's ~11 s worst-case shutdown (8 s save +
+                // 2 s SIGTERM grace + SIGKILL).
+                val stopped = withTimeoutOrNull(
+                    if (force) FORCE_STOP_WAIT_MS else GRACEFUL_STOP_WAIT_MS
+                ) {
                     container.server.runtime.first { status ->
                         status.instanceId != targetId || !status.isActive
                     }
                 } != null
                 silentMedia.stop()
                 wakeLocks.release()
-                val stillActive = !stopped &&
-                    runCatching { container.server.runtime.value.isActive }.getOrDefault(false)
+                val stillActive = !stopped && currentRuntime()?.isActive == true
                 if (stillActive) {
                     // Last resort: pid-level kill + terminal state reset. This
                     // must always end with the notification removed; a wedged
                     // STOPPING state previously looped "Shutting down…" forever.
                     Log.w(TAG, "Stop did not complete; forcing session reset")
                     runCatching { container.server.forceStop() }
-                    withTimeoutOrNull(3_000L) {
+                    withTimeoutOrNull(STALE_CLEAR_WAIT_MS) {
                         container.server.runtime.first { !it.isActive }
                     }
                     notifications.postCrashAlert(
@@ -296,22 +463,55 @@ class ForegroundServerService : Service() {
                         contentIntent = contentIntent(targetId ?: currentInstanceId),
                         restartIntent = restartServiceIntent(targetId ?: currentInstanceId)
                     )
-                    finishService()
                 } else {
                     // The user asked for the stop, so any pending auto-restart
                     // alert no longer describes reality.
                     notifications.cancelAlert()
-                    finishService()
                 }
+                // A Start pressed while the stop was winding down must not be
+                // dropped: keep this foreground service alive and hand the queued
+                // start to the command queue. No finishService() in between, so
+                // the "Stopping…" notification becomes "Starting…" seamlessly.
+                finishStopOrRunQueuedStart()
             } finally {
                 finishOperation()
             }
         }
     }
 
+    /**
+     * Ends a completed stop: runs the Start command that arrived while the stop
+     * was in progress (same foreground service, no teardown between) and/or lets
+     * an already-queued command (e.g. Restart pressed during the stop) run;
+     * otherwise finishes the service exactly as before.
+     */
+    private fun finishStopOrRunQueuedStart() {
+        val queued = pendingStartInstanceId
+        pendingStartInstanceId = null
+        if (queued != null) {
+            Log.i(TAG, "Stop finished; starting queued server $queued")
+            // Run the same bookkeeping as a Start tap: the stop path must not
+            // leave manualStopRequested set or keep the old crash-loop budget and
+            // "Server stop forced" alert behind.
+            prepareManualStart(queued)
+            // finishOperation() dispatches this right after the stop operation ends.
+            if (pendingCommand == null) {
+                pendingCommand = { startExclusive(queued) }
+            }
+        }
+        if (pendingCommand == null) {
+            // Nothing queued: this stop ends the foreground service.
+            finishService()
+        }
+        // A command queued while the stop ran (Start during Stop, Restart or a
+        // second Stop) keeps the service alive; finishOperation dispatches it.
+    }
+
     private fun beginForceStop() {
         manualStopRequested = true
         cancelAutoRestart()
+        // A force stop is final: drop a Start that was queued behind a stop.
+        pendingStartInstanceId = null
         val id = currentInstanceId ?: runCatching { container.server.runtime.value.instanceId }.getOrNull()
         scope().launch {
             runCatching { container.server.forceStop() }
@@ -333,7 +533,9 @@ class ForegroundServerService : Service() {
         manualStopRequested = false
         cancelAutoRestart()
         notifications.cancelAlert()
-        val runtime = runCatching { container.server.runtime.value }.getOrNull()
+        // A restart supersedes a Start that was queued behind a previous stop.
+        pendingStartInstanceId = null
+        val runtime = currentRuntime()
         val targetId = instanceId?.takeIf { it.isNotBlank() }
             ?: runtime?.instanceId
             ?: currentInstanceId
@@ -347,55 +549,159 @@ class ForegroundServerService : Service() {
     }
 
     private fun restartExclusive(instanceId: String?) {
-        val wasActive = runCatching { container.server.runtime.value.isActive }.getOrDefault(false)
+        // A restart is authoritative: no Start queued for an earlier stop may
+        // survive into (or after) it - only the stop completion path may consume
+        // a queued start.
+        pendingStartInstanceId = null
+        val status = currentRuntime()
+        val wasActive = status?.isActive == true
         if (wasActive) sawActiveRuntime = true
+        val decision = ServiceLifecycleDecisions.decideRestart(
+            runtimeIsActive = wasActive,
+            runtimeState = status?.state,
+            hasSession = hasActiveSession()
+        )
+        when (decision) {
+            RestartDecision.RESTART_EXISTING ->
+                restartExistingExclusive(instanceId, status)
+            RestartDecision.CLEAR_STALE_THEN_START,
+            RestartDecision.START_FRESH -> {
+                if (instanceId == null) {
+                    failEarly("There is no server to restart.")
+                    finishOperation()
+                } else {
+                    runRestartFreshOperation(
+                        instanceId = instanceId,
+                        clearStaleFirst = decision == RestartDecision.CLEAR_STALE_THEN_START
+                    )
+                }
+            }
+        }
+    }
+
+    /**
+     * Restart by asking the controller to stop+start the same instance.
+     *
+     * The whole stop→start cycle stays inside one exclusive command and
+     * [restartInFlight] is held until it completes, so the transient terminal
+     * `STOPPED` published between the halves is ignored by the runtime observer
+     * instead of finishing the service (that was the broken Restart button). The
+     * service only finishes if no new session becomes active.
+     */
+    private fun restartExistingExclusive(instanceId: String?, before: ServerRuntimeStatus?) {
+        restartInFlight = true
         startObserving()
         postStatus(force = true)
         scope().launch {
             try {
+                // Keep the wake locks across the stop→start gap: the child JVM
+                // briefly disappears, but the user asked for it back immediately.
                 wakeLocks.acquire()
-                if (wasActive) {
-                    withContext(Dispatchers.IO) {
-                        runCatching { container.server.restart() }
-                            .onFailure { Log.w(TAG, "Restart failed", it) }
+                withContext(Dispatchers.IO) {
+                    runCatching { container.server.restart() }
+                        .onFailure { Log.w(TAG, "Restart failed", it) }
+                }
+                when (awaitRestartOutcome(before)) {
+                    RestartOutcome.SUCCEEDED -> {
+                        // The restart succeeded. Clear the guard before the final
+                        // status so a crash in the same instant still runs the
+                        // normal post-mortem instead of being ignored as transient.
+                        restartInFlight = false
+                        sawActiveRuntime = true
+                        silentMedia.start()
+                        postStatus(force = true)
+                        val latest = currentRuntime()
+                        if (latest != null && !latest.isActive) handleFinished(latest)
                     }
-                } else if (instanceId != null) {
-                    val started = withContext(Dispatchers.IO) {
-                        runCatching { container.server.start(instanceId) }
-                    }
-                    val startResult = started.getOrNull()
-                    if (startResult == null) {
+                    RestartOutcome.FAILED -> {
                         wakeLocks.release()
+                        silentMedia.stop()
+                        val id = instanceId ?: currentInstanceId
                         notifications.postStartRejected(
-                            started.exceptionOrNull()?.message ?: "The server could not be started.",
-                            instanceName(instanceId),
-                            contentIntent(instanceId),
-                            restartServiceIntent(instanceId)
+                            "The server could not be restarted. Check the console for details.",
+                            instanceName(id),
+                            contentIntent(id),
+                            restartServiceIntent(id)
                         )
                         finishService()
-                        return@launch
-                    }
-                    if (startResult is StartResult.Rejected) {
-                        wakeLocks.release()
-                        notifications.postStartRejected(
-                            startResult.message,
-                            instanceName(instanceId),
-                            contentIntent(instanceId),
-                            restartServiceIntent(instanceId)
-                        )
-                        finishService()
-                        return@launch
                     }
                 }
-                sawActiveRuntime = true
-                silentMedia.start()
-                postStatus(force = true)
-                val finalStatus = runCatching { container.server.runtime.value }.getOrNull()
-                if (finalStatus != null && !finalStatus.isActive) handleFinished(finalStatus)
             } finally {
+                // Defensive: a Start pressed while a restart's stop phase looked
+                // like a normal STOPPING must not outlive the restart.
+                pendingStartInstanceId = null
+                restartInFlight = false
                 finishOperation()
             }
         }
+    }
+
+    /** Fresh start for a restart command; a stale runtime is cleared first when needed. */
+    private fun runRestartFreshOperation(instanceId: String, clearStaleFirst: Boolean) {
+        restartInFlight = true
+        scope().launch {
+            try {
+                if (clearStaleFirst) clearStaleRuntime()
+                val outcome = startServer(instanceId)
+                // The restart is over once start() returned: let the normal start
+                // post-mortem handle an immediate crash (alert/auto-restart)
+                // instead of suppressing it behind the restart guard.
+                restartInFlight = false
+                handleStartOutcome(outcome)
+            } finally {
+                // Defensive: never let a queued start outlive the restart.
+                pendingStartInstanceId = null
+                restartInFlight = false
+                finishOperation()
+            }
+        }
+    }
+
+    private enum class RestartOutcome { SUCCEEDED, FAILED }
+
+    /**
+     * Waits (bounded by [RESTART_WAIT_MS]) for the restart's new session to
+     * become active. The pre-restart RUNNING snapshot must not count as success,
+     * so a changed identity (pid or startedAt) is required. A CRASHED state fails
+     * fast; on timeout the manager's session flag is the tie-breaker so a slow
+     * OEM start is not torn down.
+     */
+    private suspend fun awaitRestartOutcome(before: ServerRuntimeStatus?): RestartOutcome {
+        val matched = withTimeoutOrNull(RESTART_WAIT_MS) {
+            container.server.runtime.first { status ->
+                when {
+                    status.state == RunState.CRASHED -> true
+                    status.state == RunState.STOPPING -> false
+                    status.isActive -> hasNewSessionIdentity(status, before)
+                    // Else: the transient STOPPED between the stop and start
+                    // halves of the restart — keep waiting for the new session.
+                    else -> false
+                }
+            }
+        }
+        if (matched == null) {
+            return if (hasActiveSession()) {
+                Log.w(TAG, "Restart did not publish an active state in time; a session exists, adopting it")
+                RestartOutcome.SUCCEEDED
+            } else {
+                Log.w(TAG, "Restart did not start a new session within ${RESTART_WAIT_MS}ms")
+                RestartOutcome.FAILED
+            }
+        }
+        if (matched.state == RunState.CRASHED) {
+            Log.w(TAG, "Restart produced a crashed session")
+            return RestartOutcome.FAILED
+        }
+        return RestartOutcome.SUCCEEDED
+    }
+
+    /** True when [status] describes a different session than the pre-restart [before]. */
+    private fun hasNewSessionIdentity(
+        status: ServerRuntimeStatus,
+        before: ServerRuntimeStatus?
+    ): Boolean {
+        if (before == null) return true
+        return status.pid != before.pid || status.startedAt != before.startedAt
     }
 
     /**
@@ -460,7 +766,7 @@ class ForegroundServerService : Service() {
                     if (status.isActive) {
                         sawActiveRuntime = true
                         postStatus(force = false)
-                    } else if (sawActiveRuntime && !operationInProgress.get()) {
+                    } else if (sawActiveRuntime && !operationInProgress.get() && !restartInFlight) {
                         handleFinished(status)
                     }
                 }
@@ -498,6 +804,10 @@ class ForegroundServerService : Service() {
 
     private fun handleFinished(status: ServerRuntimeStatus) {
         if (finishing.get()) return
+        // A restart owns the transient terminal state published between its stop
+        // and start halves; treating it as "finished" here is the old Restart bug
+        // that tore the service (and the process-wide manager) down mid-restart.
+        if (restartInFlight) return
         // A pending auto-restart already owns this crash; nothing else to do.
         if (autoRestartJob?.isActive == true) return
         val crashed = status.state == RunState.CRASHED || status.lastExit?.expected == false
@@ -726,6 +1036,10 @@ class ForegroundServerService : Service() {
 
     private fun finishService() {
         if (!finishing.compareAndSet(false, true)) return
+        // Drop any command still queued behind the operation that is finishing:
+        // this service generation is going away and a revived instance must not
+        // dispatch it (a stale Stop would kill the fresh server).
+        pendingCommand = null
         cancelAutoRestart()
         silentMedia.stop()
         wakeLocks.release()
@@ -771,6 +1085,17 @@ class ForegroundServerService : Service() {
     private fun instanceName(instanceId: String?): String? =
         instanceId?.let { runCatching { container.instances.get(it)?.name }.getOrNull() }
 
+    /** Current runtime snapshot, or null when the controller is unavailable. */
+    private fun currentRuntime(): ServerRuntimeStatus? =
+        runCatching { container.server.runtime.value }.getOrNull()
+
+    /**
+     * The controller's truthful "a child JVM exists" flag, independent of the
+     * published runtime snapshot; false on any failure.
+     */
+    private fun hasActiveSession(): Boolean =
+        runCatching { container.server.hasActiveSession() }.getOrDefault(false)
+
     /* ------------------------------------------------------------------ */
     /* Public entry points used by the UI                                 */
     /* ------------------------------------------------------------------ */
@@ -797,6 +1122,26 @@ class ForegroundServerService : Service() {
 
         /** Wait before retrying a crashed server so a hot crash loop cannot spin. */
         private const val AUTO_RESTART_DELAY_MS = 5_000L
+
+        /**
+         * Cap for waiting for a graceful stop to publish a terminal state. The
+         * manager's worst case is ~11 s (8 s Minecraft save + 2 s SIGTERM grace +
+         * SIGKILL); the old 40 s wait made a slow stop feel broken.
+         */
+        private const val GRACEFUL_STOP_WAIT_MS = 20_000L
+
+        /** Cap for waiting for a forced stop to publish a terminal state. */
+        private const val FORCE_STOP_WAIT_MS = 15_000L
+
+        /** Bounded wait for a zombie runtime to clear before a fresh start. */
+        private const val STALE_CLEAR_WAIT_MS = 3_000L
+
+        /**
+         * Cap for a restart to publish a new active session. Generous on purpose:
+         * a slow device must not be mistaken for a failed restart (which would
+         * finish the service and could shut the just-started JVM down).
+         */
+        private const val RESTART_WAIT_MS = 45_000L
 
         /** Consecutive automatic restarts allowed without a healthy RUNNING state. */
         const val MAX_AUTO_RESTART_ATTEMPTS = 3
