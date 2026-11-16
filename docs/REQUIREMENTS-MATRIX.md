@@ -101,6 +101,23 @@ controller from `onDestroy()`), so the fix is covered by the pure decision helpe
 plus compile checks; the actual service/notification behaviour and theme contrast
 are on the manual checklist in `docs/TESTING.md`.
 
+## Multi-server, port guard & themes (1.5.0)
+
+| Requirement | Status | Where |
+|---|---|---|
+| Up to 5 concurrent child JVMs (`MAX_RUNNING_SERVERS = 5`), per-instance runtime/console/status/logs, per-instance start/stop/restart/force-stop; stopping one leaves the others running; 1.4.0 lifecycle guarantees preserved per instance | Implemented (per-session manager + decision helper); multi-JVM on-device **Manual-only** | `core/api/ServerController.kt`, `core/server/ServerManager.kt`, `core/service/ForegroundServerService.kt` |
+| Focused console: `runtimes` map, `activeInstanceId`, `focus(instanceId)` switches the live console/notification feed; instance screens use `runtimeFor(id)` | Implemented (Compose/ViewModel; compile-checked) | `ServerManager`, `AppViewModel`, `ui/screens/HomeScreen.kt`, `ConsoleScreen.kt`, `ServerDetailScreen.kt` |
+| Port-conflict guard: resolved port (`server.properties` → instance port → 25565 for Minecraft; instance port for generic), `portOwner(port, except)` names the owner, start rejected on conflict/session limit, setup/edit warnings from `portOwners` (warning, not a hard block) | Implemented; **review-verified** (logic is Android-dependent, no hermetic port tests); bind-error path and UI warnings compile-checked | `ServerManager`, `AppUiState.portOwners`, `CreateInstanceScreen.kt`, `PropertiesScreen.kt`, `ServerDetailScreen.kt` |
+| Home: one active-server panel per running server, active servers removed from the “Servers” list, “N running / 5” indicator, tap focuses; notification shows focused server + running count with Stop focused/Restart focused/Stop all | Implemented (Compose; visual/device **Manual-only**) | `HomeScreen.kt`, `ForegroundServerService.kt`, `ServerNotifications.kt` |
+| Theme picker: System / Light / Dark / Material You / Monochromatic Blue / Energy / Triadic / Analog Green / High Contrast Black; per-theme light+dark, immediate apply, Material You Android 12+ with System fallback, active-server accent = theme primary | Verified (`ThemePalettesTest` asserts exact hex values); Compose schemes compile-checked; visual **Manual-only** | `core/model/ThemePalette.kt`, `ui/theme/ThemeCatalog.kt`, `ui/theme/Theme.kt`, `SettingsScreen.kt`, `MainActivity.kt` |
+| Bedrock bridge single-owner across concurrent sessions: first Minecraft+Geyser session owns UDP 19132/19133, later sessions warned and keep running the Java server | Implemented (warning path); real LAN **Manual-only** | `ServerManager`, `BedrockLanRelay`, LAN card |
+| Honest multi-JVM resource model: per-server heap limit enforced, total not reserved; service/lock set covers all sessions | Implemented; battery/RAM behaviour **Manual-only** | `ServerManager`, `ForegroundServerService`, `MemoryAdvisor` |
+
+Note: with up to five JVMs the aggregate memory is not reserved — five servers
+with their configured heaps must fit alongside Android. The notification and
+console show one focused server, not five consoles at once, and the Bedrock
+bridge is single-server by design.
+
 ## Memory
 
 | Requirement | Status | Where |
@@ -147,16 +164,20 @@ are on the manual checklist in `docs/TESTING.md`.
 8. **JRE size** — not in APK; downloaded from Termux mirrors with SHA-256 verification (~96–117 MB per major, ~170 MB installed).
 9. **LAN discovery is best-effort** — the Minecraft announcement is an emulation of “Open to LAN”, not a protocol dedicated servers implement. Clients must be on the same Wi-Fi/hotspot; AP/client isolation and guest networks block LAN traffic; some clients/versions do not scan the LAN list, and Bedrock clients still need Geyser/Floodgate. The LAN card's manual address is authoritative.
 10. **Bedrock LAN is best-effort too** — the 19132 bridge makes a **Geyser-Spigot + Floodgate** setup discoverable over RakNet (IPv4 only, applied at the next server start; Geyser is set to `transport: both` because 2.12.1 defaults to NetherNet). AP/client isolation, router broadcast filtering and Windows client firewalls can still block discovery. **Bedrock 26.60+ clients use NetherNet and may not join through 19132** — use Geyser's direct **Add Server** `<phone-ip>:19133`; Geyser's NetherNet native library may not load on Android/bionic (plugin-native limitation), some 2026 clients fail to list a valid pong (MCPE-239883), and console Bedrock builds vary.
+11. **Multi-JVM needs memory/battery headroom** — up to 5 servers each keep their configured heap and JavaHost does not reserve the total, so five servers can exhaust RAM/OOM-kill and drain the battery; smaller heaps and the power guide are advised. The focused console/notification is one server at a time.
+12. **Bedrock bridge is single-server** — the first Minecraft+Geyser session owns UDP 19132; later Geyser sessions are warned and keep their Java server running without the bridge. Java LAN discovery is announced per session.
 
 ## Not testable in this environment
 
 On-device FGS/Doze/swipe/notification rendering, the real Stop → Start / Restart
-service transitions and stop timings, light/dark theme contrast and visual
-rendering, SAF provider interactions, actual `exec()` from the app sandbox on a
-retail ROM, the real-network LAN paths (multicast announcement, AP/client
-isolation, Android 16/17 local-network consent), the Bedrock bridge's real LAN
-discovery/relay and the NetherNet direct path (need a Geyser server plus Bedrock
-clients of both generations, and Geyser's NetherNet native library on the
-phone): no device/emulator/ADB was available. `docs/TESTING.md` marks these as
-manual-only and provides the full checklist; the host-level integration evidence
-is in that file.
+service transitions and stop timings, concurrent multi-JVM behaviour (five JVMs,
+focus switching, per-instance crash/auto-restart), light/dark/custom theme
+contrast, Material You dynamic colour and visual rendering, SAF provider
+interactions, actual `exec()` from the app sandbox on a retail ROM, the
+real-network LAN paths (multicast announcement, AP/client isolation, Android
+16/17 local-network consent), the Bedrock bridge's real LAN discovery/relay and
+the single-owner behaviour with several sessions, and the NetherNet direct path
+(need a Geyser server plus Bedrock clients of both generations): no
+device/emulator/ADB was available. `docs/TESTING.md` marks these as manual-only
+and provides the full checklist; the host-level integration evidence is in that
+file.

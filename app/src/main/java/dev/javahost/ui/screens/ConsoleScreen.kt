@@ -114,7 +114,10 @@ fun ConsoleScreen(
     var notice by remember { mutableStateOf<ConsoleNotice?>(null) }
     var history by remember(instance.id) { mutableStateOf<List<ConsoleEntry>>(emptyList()) }
 
-    val runtime = state.runtime
+    // Per-instance runtime; opening this screen focuses the instance so the
+    // controller's console flow and entries belong to it.
+    LaunchedEffect(instance.id) { actions.focusConsole(instance.id) }
+    val runtime = state.runtimeFor(instance.id)
     val attached = runtime.instanceId == instance.id
     val running = attached && runtime.state == RunState.RUNNING
     val shownState = if (attached) runtime.state else RunState.STOPPED
@@ -171,7 +174,7 @@ fun ConsoleScreen(
     ) { uri ->
         if (uri != null) {
             try {
-                actions.exportConsole(uri)
+                actions.exportConsole(instance.id, uri)
                 notice = ConsoleNotice("Console log exported.")
             } catch (t: Throwable) {
                 notice = ConsoleNotice("Export failed: ${t.readableMessage()}", isError = true)
@@ -196,7 +199,7 @@ fun ConsoleScreen(
                     isError = true
                 )
                 else -> try {
-                    actions.sendCommand(cmd)
+                    actions.sendCommand(instance.id, cmd)
                     command = ""
                     notice = null
                 } catch (t: Throwable) {
@@ -291,7 +294,7 @@ fun ConsoleScreen(
                         onClick = { showTimestamps = !showTimestamps },
                         label = { Text("Timestamps", fontSize = 11.sp) }
                     )
-                    TextButton(onClick = { actions.clearConsole() }, enabled = entries.isNotEmpty()) {
+                    TextButton(onClick = { actions.clearConsole(instance.id) }, enabled = entries.isNotEmpty()) {
                         Icon(Icons.Default.Delete, contentDescription = null, modifier = Modifier.size(16.dp))
                         Spacer(Modifier.width(4.dp))
                         Text("Clear")
@@ -433,7 +436,7 @@ fun ConsoleScreen(
             destructive = true,
             onConfirm = {
                 try {
-                    actions.sendCommand("stop")
+                    actions.sendCommand(instance.id, "stop")
                 } catch (t: Throwable) {
                     notice = ConsoleNotice("Could not stop the server: ${t.readableMessage()}", isError = true)
                 }

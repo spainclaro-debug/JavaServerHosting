@@ -38,13 +38,16 @@ import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import dev.javahost.core.api.ServerController
 import dev.javahost.core.model.ExitReason
 import dev.javahost.core.model.RunState
 import dev.javahost.core.model.ServerFlavor
 import dev.javahost.core.model.ServerInstance
+import dev.javahost.core.model.ServerRuntimeStatus
 import dev.javahost.ui.AppActions
 import dev.javahost.ui.AppUiState
 import dev.javahost.ui.components.CodeLine
@@ -109,12 +112,22 @@ fun HomeScreen(
     onOpenConsole: (String) -> Unit
 ) {
     val crash = state.lastCrash
-    val crashInstance = state.instance(state.activeInstanceId ?: state.settings.lastActiveInstanceId)
-    // The server shown in the top panel. While it is active it must not also appear in
-    // the "Servers" list below; it returns to the list as soon as it stops.
-    val activePanel = state.activeInstance?.takeIf { state.runtime.isActive }
-    val listedInstances = state.instances.filterNot { it.id == activePanel?.id }
-    val statusColors = javaHostStatusColors()
+    val crashInstance = (state.lastCrashInstanceId
+        ?: state.activeInstanceId
+        ?: state.settings.lastActiveInstanceId)?.let { state.instance(it) }
+    // Every active server gets its own card in the top panel. While active an
+    // instance is removed from the "Servers" list and returns as soon as it stops.
+    val activeInstances = state.activeInstanceIds
+        .mapNotNull { id -> state.instance(id) }
+        // Stable order: oldest server first, then instance id for ties.
+        .sortedWith(
+            compareBy<ServerInstance>(
+                { state.runtimeFor(it.id).startedAt ?: Long.MAX_VALUE },
+                { it.id }
+            )
+        )
+    val activeIds = activeInstances.mapTo(HashSet()) { it.id }
+    val listedInstances = state.instances.filterNot { it.id in activeIds }
 
     Scaffold(
         topBar = {
@@ -192,26 +205,21 @@ fun HomeScreen(
                     CrashBannerCard(
                         crash = crash,
                         crashInstance = crashInstance,
-                        onRestart = {
-                            if (crashInstance != null) actions.startServer(crashInstance.id)
-                            else actions.restartServer()
-                        },
+                        onRestart = { crashInstance?.let { actions.startServer(it.id) } },
                         onDetails = crashInstance?.let { instance -> { onOpenInstance(instance.id) } },
                         onDismiss = actions::dismissCrash
                     )
                 }
             }
 
-            if (activePanel != null) {
-                item {
-                    ActiveServerCard(
-                        state = state,
-                        instance = activePanel,
-                        onOpenConsole = { onOpenConsole(activePanel.id) },
-                        onOpenDetails = { onOpenInstance(activePanel.id) },
-                        actions = actions
-                    )
-                }
+            items(activeInstances, key = { "active-${it.id}" }) { instance ->
+                ActiveServerCard(
+                    instance = instance,
+                    runtime = state.runtimeFor(instance.id),
+                    actions = actions,
+                    onOpenConsole = { onOpenConsole(instance.id) },
+                    onOpenDetails = { onOpenInstance(instance.id) }
+                )
             }
 
             item {
@@ -221,8 +229,8 @@ fun HomeScreen(
                         style = MaterialTheme.typography.titleMedium,
                         modifier = Modifier.weight(1f)
                     )
-                    if (state.activeInstanceId != null) {
-                        Tag("1 JVM limit", statusColors.warning)
+                    if (state.runningCount > 0) {
+                        Tag("${state.runningCount} running / ${ServerController.MAX_RUNNING_SERVERS}")
                     }
                 }
             }
@@ -240,7 +248,7 @@ fun HomeScreen(
                 }
                 listedInstances.isEmpty() -> item {
                     Text(
-                        "The running server is shown in the panel above. It returns to this list when stopped.",
+                        "All running servers are shown in the panels above. They return to this list when stopped.",
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -251,7 +259,7 @@ fun HomeScreen(
                         instance = instance,
                         onOpen = { onOpenInstance(instance.id) },
                         onStart = { actions.startServer(instance.id) },
-                        onStop = { actions.stopServer(false) },
+                        onStop = { actions.stopServer(instance.id) },
                         onOpenJre = onOpenJre
                     )
                 }
@@ -311,18 +319,25 @@ private fun CrashBannerCard(
 
 @Composable
 private fun ActiveServerCard(
-    state: AppUiState,
     instance: ServerInstance,
+    runtime: ServerRuntimeStatus,
     actions: AppActions,
     onOpenConsole: () -> Unit,
     onOpenDetails: () -> Unit
 ) {
-    val runtime = state.runtime
     val accent = MaterialTheme.colorScheme.primary
     // TealGreen on the dark primaryContainer (TealDeep) is only ~2.7:1, so dark mode
     // falls back to a near-white title (5.0:1). Light keeps the ink accent (5.96:1).
     val accentText = if (isSystemInDarkTheme()) Color.White else accent
+    // The whole panel is tappable: focusing first, then opening the server details.
+    // Inner buttons still handle their own clicks (they consume the tap).
     SectionCard(
+        modifier = Modifier
+            .clip(RoundedCornerShape(16.dp))
+            .clickable {
+                actions.focusConsole(instance.id)
+                onOpenDetails()
+            },
         title = instance.name,
         subtitle = "Active server · ${mainFlavorLabel(instance.flavor)}",
         containerColor = MaterialTheme.colorScheme.primaryContainer,
@@ -362,7 +377,7 @@ private fun ActiveServerCard(
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             OutlinedButton(onClick = onOpenConsole, modifier = Modifier.weight(1f)) { Text("Console") }
             if (runtime.state != RunState.STOPPING) {
-                Button(onClick = { actions.stopServer(false) }, modifier = Modifier.weight(1f)) {
+                Button(onClick = { actions.stopServer(instance.id) }, modifier = Modifier.weight(1f)) {
                     Text("Stop")
                 }
             }
@@ -380,13 +395,13 @@ private fun InstanceCard(
     onStop: () -> Unit,
     onOpenJre: () -> Unit
 ) {
-    val runtime = state.runtime
+    val runtime = state.runtimeFor(instance.id)
     val isThisActive = runtime.instanceId == instance.id && runtime.isActive
-    val anyActive = runtime.isActive
     val jreInstalled = state.isInstalled(instance.jreMajor)
     val eulaOk = !instance.isMinecraft || instance.eulaAccepted
-    val anotherServerActive = anyActive && runtime.instanceId != instance.id
-    val canStart = !isThisActive && !anotherServerActive && jreInstalled && eulaOk
+    val atRunningLimit = !isThisActive &&
+        state.runningCount >= ServerController.MAX_RUNNING_SERVERS
+    val canStart = !isThisActive && !atRunningLimit && jreInstalled && eulaOk
     val crashSummary = instance.lastCrashSummary
     val stateForPill = when {
         isThisActive -> runtime.state
@@ -466,10 +481,11 @@ private fun InstanceCard(
                 }
             }
             when {
-                anotherServerActive -> Text(
-                    "Another server is running. Only one JVM is hosted at a time.",
+                atRunningLimit -> Text(
+                    "${ServerController.MAX_RUNNING_SERVERS} servers are already running. " +
+                        "Stop one before starting another.",
                     style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                    color = statusColors.warning
                 )
                 !jreInstalled -> Text(
                     "Install Java ${instance.jreMajor} before starting this server.",

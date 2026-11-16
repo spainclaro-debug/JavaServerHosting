@@ -10,71 +10,88 @@ import java.io.File
 /**
  * Contract used by the UI and the foreground service.
  *
- * Exactly one Java server process is hosted at a time; multiple instances may
- * exist on disk. Implementations must be process-wide singletons owned by
+ * Up to [MAX_RUNNING_SERVERS] child JVMs may run at the same time, one per
+ * instance, as long as their ports differ. [runtime], [consoleEntries] and
+ * [activeInstanceId] always describe the *focused* instance (what the console
+ * screen and the ongoing notification show); [runtimes] carries the per-instance
+ * status used by the Home cards and the server detail screen.
+ *
+ * Implementations must be process-wide singletons owned by
  * [dev.javahost.AppContainer] so the service and Compose UI observe the same
  * state even when the Activity is destroyed.
  */
 interface ServerController {
     val runtime: StateFlow<ServerRuntimeStatus>
+    val runtimes: StateFlow<Map<String, ServerRuntimeStatus>>
     val activeInstanceId: StateFlow<String?>
     val consoleEntries: StateFlow<List<ConsoleEntry>>
 
     /**
-     * Resolve the instance, validate JRE/EULA/JAR, build the launch command and
-     * spawn the child process. Call from the foreground service.
+     * Resolve the instance, validate JRE/EULA/JAR/port, build the launch command
+     * and spawn the child process. Rejects when [MAX_RUNNING_SERVERS] are already
+     * running, the instance is already running, or its port conflicts.
      */
     fun start(instanceId: String): StartResult
 
-    /** Graceful stop (sends "stop" for Minecraft, then destroys after a timeout). */
-    fun stop(force: Boolean = false)
+    /** Graceful stop of one server (others keep running). */
+    fun stop(instanceId: String, force: Boolean = false)
 
-    /** Stop then start the same instance. No-op when nothing is active. */
-    fun restart()
+    /** Stop then start the same instance; other sessions are unaffected. */
+    fun restart(instanceId: String)
 
-    fun sendCommand(command: String)
+    /** Last-resort kill of one wedged session (returns true when cleared). */
+    fun forceStop(instanceId: String): Boolean
 
-    fun clearConsole()
+    /** Last-resort kill of every session (returns the number cleared). */
+    fun forceStopAll(): Int
 
-    /** Copy the current in-memory console into [destination]. */
-    fun exportConsole(destination: File): Result<File>
+    fun sendCommand(instanceId: String, command: String)
 
-    /** Last N raw lines, e.g. to show a post-mortem after an OOM kill. */
-    fun recentTail(count: Int): List<String>
+    /** Switch the focused instance (console + notification target). */
+    fun focus(instanceId: String)
 
-    fun activeLastCrash(): ExitInfo?
+    fun clearConsole(instanceId: String)
 
-    /** Instance-aware historical console tail (disk first when not the active session). */
+    /** Copy the in-memory console of one instance into [destination]. */
+    fun exportConsole(instanceId: String, destination: File): Result<File>
+
+    /** Last N raw lines of one instance (in-memory tail, then crash, then disk). */
+    fun recentTail(instanceId: String, count: Int): List<String>
+
+    fun activeLastCrash(instanceId: String): ExitInfo?
+
+    /** Instance-aware historical console tail (disk first when not active). */
     fun readStartupTail(instanceId: String, lines: Int): List<String> = emptyList()
 
-    /** Clears the last-crash report without touching the saved crash files. */
-    fun clearLastCrash() = Unit
+    /** Clears the last-crash report of one instance without touching crash files. */
+    fun clearLastCrash(instanceId: String) = Unit
 
     /**
-     * Last-resort recovery for a wedged stop (normally only needed if a ROM
-     * kills process reaping): kill the child by pid, publish a terminal state,
-     * and clear the session so a later Start/Restart can work. Returns true if a
-     * session was forcibly cleared.
+     * Re-resolve the LAN addresses of one running instance, TCP-probe each one
+     * and publish to that instance's runtime. False when it is not running.
      */
-    fun forceStop(): Boolean = false
+    fun probeLan(instanceId: String): Boolean = false
+
+    /** True while a child JVM session exists for [instanceId]. */
+    fun hasActiveSession(instanceId: String): Boolean = false
+
+    /** True while at least one child JVM session exists. */
+    fun hasAnyActiveSession(): Boolean = false
 
     /**
-     * Re-resolve the LAN addresses of the running server, TCP-probe each one and
-     * publish the result to [ServerRuntimeStatus.lan] (the UI's "Test LAN
-     * reachability" action). Returns false when no server is active.
+     * Name of the instance that owns [port] — either a currently running session
+     * or an instance whose configured port is [port]. Used for setup warnings and
+     * start-time conflict rejection.
      */
-    fun probeLan(): Boolean = false
-
-    /**
-     * True while a child JVM session actually exists. This is deliberately
-     * independent of the published [runtime] state: after a lifecycle bug or an
-     * OEM process kill the runtime can be stale, and the foreground service uses
-     * this to distinguish "really running" from "stale snapshot".
-     */
-    fun hasActiveSession(): Boolean = false
+    fun portOwner(port: Int, exceptInstanceId: String? = null): String? = null
 
     /** Called when the service is being destroyed; must not leave a JVM behind. */
     fun shutdown()
 
     fun dispose()
+
+    companion object {
+        /** Maximum number of simultaneously hosted child JVMs. */
+        const val MAX_RUNNING_SERVERS = 5
+    }
 }

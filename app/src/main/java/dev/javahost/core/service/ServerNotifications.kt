@@ -74,21 +74,26 @@ class ServerNotifications(context: Context) {
     /* Builders                                                           */
     /* ------------------------------------------------------------------ */
 
-    /** Ongoing status notification: name, state, uptime, players, heap, free RAM. */
+    /**
+     * Ongoing status notification for the focused server: name, state, uptime,
+     * players, heap, free RAM and a "N servers running" summary when more than
+     * one child JVM is hosted. Actions: Stop focused, Restart focused, Stop all.
+     */
     fun buildStatus(
         status: ServerRuntimeStatus,
         instanceName: String?,
         isMinecraft: Boolean,
+        runningCount: Int,
         fallbackDeviceAvailMb: Long,
         fallbackDeviceTotalMb: Long,
         contentIntent: PendingIntent?,
         stopIntent: PendingIntent?,
         restartIntent: PendingIntent?,
-        forceStopIntent: PendingIntent? = null
+        stopAllIntent: PendingIntent? = null
     ): Notification {
         val title = instanceName?.takeIf { it.isNotBlank() }
             ?: appContext.getString(R.string.app_name)
-        val lines = ArrayList<String>(4)
+        val lines = ArrayList<String>(5)
         lines.add(stateLabel(status.state))
         if (status.state == RunState.STARTING || status.state == RunState.RUNNING ||
             status.state == RunState.STOPPING
@@ -116,9 +121,10 @@ class ServerNotifications(context: Context) {
             availMb > 0 && totalMb > 0 -> lines.add("${formatRamMb(availMb)} free of ${formatRamMb(totalMb)}")
             availMb > 0 -> lines.add("${formatRamMb(availMb)} free")
         }
+        if (runningCount > 0) lines.add(runningSummary(runningCount))
         val text = lines.joinToString(" · ")
 
-        return baseStatusBuilder(title, text, contentIntent, stopIntent, restartIntent, forceStopIntent)
+        return baseStatusBuilder(title, text, contentIntent, stopIntent, restartIntent, stopAllIntent)
             .build()
     }
 
@@ -210,7 +216,7 @@ class ServerNotifications(context: Context) {
         contentIntent: PendingIntent?,
         stopIntent: PendingIntent?,
         restartIntent: PendingIntent?,
-        forceStopIntent: PendingIntent? = null
+        stopAllIntent: PendingIntent? = null
     ): NotificationCompat.Builder {
         val builder = NotificationCompat.Builder(appContext, CHANNEL_STATUS)
             .setSmallIcon(R.drawable.ic_stat_server)
@@ -231,8 +237,10 @@ class ServerNotifications(context: Context) {
         if (restartIntent != null) {
             builder.addAction(0, appContext.getString(R.string.notification_restart), restartIntent)
         }
-        if (forceStopIntent != null) {
-            builder.addAction(0, appContext.getString(R.string.notification_force_stop), forceStopIntent)
+        if (stopAllIntent != null) {
+            // No dedicated string resource yet (the service layer must not edit
+            // res/); keep the label explicit instead of reusing "Force stop".
+            builder.addAction(0, STOP_ALL_LABEL, stopAllIntent)
         }
         return builder
     }
@@ -283,6 +291,9 @@ class ServerNotifications(context: Context) {
     companion object {
         const val TAG = "ServerNotifications"
 
+        /** Action label for "Stop all"; kept resource-free to stay inside the service scope. */
+        const val STOP_ALL_LABEL = "Stop all"
+
         const val CHANNEL_STATUS = "server_status"
         const val CHANNEL_ALERTS = "server_alerts"
         const val CHANNEL_DOWNLOADS = "downloads"
@@ -303,6 +314,10 @@ class ServerNotifications(context: Context) {
             RunState.STOPPING -> "Stopping…"
             RunState.CRASHED -> "Crashed"
         }
+
+        /** "1 server running" / "N servers running" summary line for the status notification. */
+        fun runningSummary(runningCount: Int): String =
+            if (runningCount == 1) "1 server running" else "$runningCount servers running"
 
         /** Compact uptime: `42s`, `7m 03s`, `2h 14m`. */
         fun formatUptime(uptimeMs: Long): String {

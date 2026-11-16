@@ -11,6 +11,7 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import dev.javahost.BuildConfig
 import dev.javahost.JavaHostApp
+import dev.javahost.core.api.ServerController
 import dev.javahost.core.jar.JarInspector
 import dev.javahost.core.model.AppSettings
 import dev.javahost.core.model.ConsoleEntry
@@ -29,7 +30,7 @@ import dev.javahost.core.model.PendingJar
 import dev.javahost.core.model.ServerInstance
 import dev.javahost.core.model.ServerKind
 import dev.javahost.core.model.ServerRuntimeStatus
-import dev.javahost.core.model.StartResult
+import dev.javahost.core.model.ThemeChoice
 import dev.javahost.core.model.UiMessage
 import dev.javahost.core.net.BedrockGeyserConfig
 import dev.javahost.core.service.ForegroundServerService
@@ -95,24 +96,53 @@ class AppViewModel(application: Application) : AndroidViewModel(application), Ap
         viewModelScope.launch {
             container.instances.instances.collect { instances ->
                 val bedrockDetected = detectBedrockInstances(instances)
-                _state.update { it.copy(instances = instances, bedrockDetected = bedrockDetected) }
+                val portIndex = computePortIndex(instances)
+                _state.update {
+                    it.copy(
+                        instances = instances,
+                        bedrockDetected = bedrockDetected,
+                        portOwners = portIndex.owners,
+                        portOwnerIds = portIndex.ownerIds,
+                        instancePorts = portIndex.ports
+                    )
+                }
             }
         }
+        // Per-instance status for the Home active cards / detail screen.
+        viewModelScope.launch {
+            container.server.runtimes.collect { runtimes ->
+                _state.update { previous ->
+                    // Crash banner = newest unexpected exit across every instance.
+                    val newestExit = runtimes.values
+                        .mapNotNull { status ->
+                            status.lastExit
+                                ?.takeIf { exit -> !exit.expected }
+                                ?.let { exit -> status.instanceId to exit }
+                        }
+                        .maxByOrNull { (_, exit) -> exit.timestamp }
+                    val restartedBannerInstance = newestExit == null &&
+                        previous.lastCrashInstanceId?.let { id -> runtimes[id]?.isActive == true } == true
+                    previous.copy(
+                        runtimes = runtimes,
+                        lastCrash = when {
+                            newestExit != null -> newestExit.second
+                            restartedBannerInstance -> null
+                            else -> previous.lastCrash
+                        },
+                        lastCrashInstanceId = when {
+                            newestExit != null -> newestExit.first
+                            restartedBannerInstance -> null
+                            else -> previous.lastCrashInstanceId
+                        }
+                    )
+                }
+            }
+        }
+        // Focused runtime mirror (back-compat for the console + notification target).
         viewModelScope.launch {
             container.server.runtime.collect { runtime ->
                 _state.update { previous ->
-                    val unexpectedExit = runtime.lastExit?.takeIf { !it.expected }
-                    previous.copy(
-                        runtime = runtime,
-                        activeInstanceId = runtime.instanceId,
-                        // Never surface a user-requested stop as a crash. Clear
-                        // the banner when a new run starts so it cannot go stale.
-                        lastCrash = when {
-                            unexpectedExit != null -> unexpectedExit
-                            runtime.isActive -> null
-                            else -> previous.lastCrash
-                        }
-                    )
+                    previous.copy(runtime = runtime, activeInstanceId = runtime.instanceId)
                 }
             }
         }
@@ -165,7 +195,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application), Ap
                     it.copy(lastCrashSummary = null, lastExitCode = null, lastExitAt = null)
                 }
             }
-        container.server.clearLastCrash()
+        _state.value.lastCrashInstanceId?.let { container.server.clearLastCrash(it) }
     }
 
     override fun completeWizard() {
@@ -516,16 +546,14 @@ class AppViewModel(application: Application) : AndroidViewModel(application), Ap
     }
 
     override fun deleteInstance(id: String) {
-        val runtime = _state.value.runtime
-        val needsStop = runtime.isActive && runtime.instanceId == id
+        val needsStop = _state.value.runtimes[id]?.isActive == true ||
+            container.server.hasActiveSession(id)
         viewModelScope.launch {
             if (needsStop) {
                 showMessage("Stopping the server before deleting its files…")
-                runCatching { ForegroundServerService.stop(context, force = true) }
+                runCatching { ForegroundServerService.stop(context, id, force = true) }
                 val stopped = withTimeoutOrNull(20_000) {
-                    container.server.runtime.first { status ->
-                        status.instanceId != id || !status.isActive
-                    }
+                    container.server.runtimes.first { runtimes -> runtimes[id]?.isActive != true }
                 } != null
                 if (!stopped) {
                     showMessage(
@@ -572,41 +600,64 @@ class AppViewModel(application: Application) : AndroidViewModel(application), Ap
             showMessage("Accept the Minecraft EULA on the instance screen before starting.", true)
             return
         }
-        val runtime = container.server.runtime.value
-        if (runtime.isActive && runtime.instanceId != id) {
-            showMessage("Stop ${runtime.instanceName ?: "the running server"} first. Only one JVM is hosted at a time.", true)
+        // Multiple servers may run at once. The manager is authoritative, but its
+        // StartResult.Rejected only reaches the notification; mirror the two common
+        // rejections here so the user also sees them in-app.
+        if (_state.value.runtimes[id]?.isActive == true) {
+            showMessage("${instance.name} is already running.", true)
+            return
+        }
+        if (_state.value.runningCount >= ServerController.MAX_RUNNING_SERVERS) {
+            showMessage(
+                "Up to ${ServerController.MAX_RUNNING_SERVERS} servers can run at the same time. " +
+                    "Stop one before starting another.",
+                true
+            )
+            return
+        }
+        val port = _state.value.instancePorts[id]
+        val portOwner = port?.let { container.server.portOwner(it, exceptInstanceId = id) }
+        if (port != null && portOwner != null) {
+            showMessage(
+                "Port $port is already used by $portOwner. Change the port of one of the servers first.",
+                true
+            )
             return
         }
         runCatching { ForegroundServerService.start(context, id) }
             .onFailure { showMessage("Could not start the server service: ${it.message}", true) }
     }
 
-    override fun stopServer(force: Boolean) {
-        runCatching { ForegroundServerService.stop(context, force) }
+    override fun stopServer(id: String, force: Boolean) {
+        runCatching { ForegroundServerService.stop(context, id, force) }
             .onFailure { showMessage("Could not stop the server: ${it.message}", true) }
     }
 
-    override fun restartServer() {
-        runCatching { ForegroundServerService.restart(context) }
+    override fun restartServer(id: String) {
+        runCatching { ForegroundServerService.restart(context, id) }
             .onFailure { showMessage("Could not restart the server: ${it.message}", true) }
     }
 
-    override fun forceStopServer() {
-        runCatching { ForegroundServerService.forceStop(context) }
+    override fun forceStopServer(id: String) {
+        runCatching { ForegroundServerService.forceStop(context, id) }
             .onFailure {
-                // Even if the service helper fails, clear the controller state.
-                container.server.forceStop()
+                // Even if the service helper fails, clear this session in the controller.
+                container.server.forceStop(id)
                 showMessage("Force-stopped the server session.", true)
             }
     }
 
-    override fun sendCommand(command: String) {
+    override fun sendCommand(instanceId: String, command: String) {
         if (command.isBlank()) return
-        container.server.sendCommand(command)
+        container.server.sendCommand(instanceId, command)
     }
 
-    override fun probeLan() {
-        if (!container.server.probeLan()) {
+    override fun focusConsole(instanceId: String) {
+        container.server.focus(instanceId)
+    }
+
+    override fun probeLan(instanceId: String) {
+        if (!container.server.probeLan(instanceId)) {
             showMessage("Start the server to test its LAN address.")
             return
         }
@@ -619,15 +670,15 @@ class AppViewModel(application: Application) : AndroidViewModel(application), Ap
         refreshDeviceInfo()
     }
 
-    override fun clearConsole() {
-        container.server.clearConsole()
+    override fun clearConsole(instanceId: String) {
+        container.server.clearConsole(instanceId)
     }
 
-    override fun exportConsole(uri: Uri) {
+    override fun exportConsole(instanceId: String, uri: Uri) {
         viewModelScope.launch {
             try {
                 val temp = File(container.paths.downloadsDir, "console-${System.currentTimeMillis()}.log")
-                val exported = container.server.exportConsole(temp).getOrThrow()
+                val exported = container.server.exportConsole(instanceId, temp).getOrThrow()
                 withContext(Dispatchers.IO) {
                     context.contentResolver.openOutputStream(uri)?.use { out ->
                         exported.inputStream().use { it.copyTo(out) }
@@ -657,6 +708,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application), Ap
         container.settings.update(transform)
     }
 
+    override fun setTheme(theme: ThemeChoice) = updateSettings { it.copy(theme = theme) }
     override fun setDefaultMemory(mb: Int) = updateSettings { it.copy(defaultMemoryMb = mb) }
     override fun setAutoMemoryDefault(enabled: Boolean) = updateSettings { it.copy(autoMemoryByDefault = enabled) }
     override fun setDefaultJre(major: Int) = updateSettings { it.copy(defaultJreMajor = major) }
@@ -918,6 +970,44 @@ class AppViewModel(application: Application) : AndroidViewModel(application), Ap
                 file.extension.equals("jar", ignoreCase = true) &&
                 file.name.lowercase(Locale.ROOT).contains("geyser")
         }
+
+    /** Configured ports of every instance, indexed for the port-conflict warnings. */
+    private data class PortIndex(
+        val owners: Map<Int, String>,
+        val ownerIds: Map<Int, String>,
+        val ports: Map<String, Int>
+    )
+
+    /**
+     * Resolves every instance's configured port off the main thread and indexes it
+     * (Minecraft: `server.properties server-port`, then `instance.serverPort`, then
+     * 25565; generic: `instance.serverPort`, skipped when unknown). Never throws.
+     */
+    private suspend fun computePortIndex(instances: List<ServerInstance>): PortIndex =
+        withContext(Dispatchers.IO) {
+            val ports = LinkedHashMap<String, Int>()
+            val owners = LinkedHashMap<Int, String>()
+            val ownerIds = LinkedHashMap<Int, String>()
+            for (instance in instances) {
+                val port = runCatching { resolveConfiguredPort(instance) }.getOrNull() ?: continue
+                ports[instance.id] = port
+                if (!owners.containsKey(port)) {
+                    owners[port] = instance.name
+                    ownerIds[port] = instance.id
+                }
+            }
+            PortIndex(owners = owners, ownerIds = ownerIds, ports = ports)
+        }
+
+    private fun resolveConfiguredPort(instance: ServerInstance): Int? {
+        if (!instance.isMinecraft) return instance.serverPort
+        val propertyPort = runCatching {
+            ServerPropertiesCodec.port(
+                ServerPropertiesCodec.read(container.paths.serverProperties(instance.id))
+            )
+        }.getOrNull()
+        return propertyPort ?: instance.serverPort ?: 25565
+    }
 
     override fun onCleared() {
         // The child JVM belongs to the foreground service, not the ViewModel.

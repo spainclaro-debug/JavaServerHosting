@@ -402,6 +402,15 @@ fun CreateInstanceScreen(
                     supportingText = portError
                         ?: "Recorded as metadata. Minecraft expects 25565; change it in server.properties."
                 )
+                val portOwner = portValue?.let { state.portConflictFor(it) }
+                if (portError == null && portOwner != null) {
+                    Text(
+                        "Port $portValue is already used by ${portOwner.name}. Use a different port or " +
+                            "the servers cannot run at the same time.",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = javaHostStatusColors().warning
+                    )
+                }
             }
 
             /* ---------------- EULA gate ---------------- */

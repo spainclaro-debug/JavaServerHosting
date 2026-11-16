@@ -47,8 +47,11 @@ class AndroidLanInfo(context: Context) {
         runCatching { appContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager }
             .getOrNull()
 
-    /** Non-reference-counted Wi-Fi multicast lock, created on first use. */
+    /** Wi-Fi multicast lock, created on first use and reference-counted by the callers. */
     private var wifiMulticastLock: WifiManager.MulticastLock? = null
+
+    /** Number of sessions currently relying on the multicast lock. */
+    private var multicastLockHolders: Int = 0
 
     /**
      * The phone's usable LAN interfaces: up, non-loopback, non-point-to-point
@@ -177,6 +180,7 @@ class AndroidLanInfo(context: Context) {
                 created
             }
             if (!lock.isHeld) lock.acquire()
+            multicastLockHolders++
             true
         } catch (t: Throwable) {
             Log.w(TAG, "Could not acquire Wi-Fi multicast lock", t)
@@ -185,9 +189,16 @@ class AndroidLanInfo(context: Context) {
         }
     }
 
-    /** Releases the multicast lock if it is held. Safe to call repeatedly. */
+    /**
+     * Releases one reference to the multicast lock. The underlying Wi-Fi lock is
+     * only released when the last session stops using it (up to
+     * [dev.javahost.core.api.ServerController.MAX_RUNNING_SERVERS] sessions can
+     * announce their Minecraft server at the same time). Safe to call repeatedly.
+     */
     @Synchronized
     fun releaseMulticastLock() {
+        if (multicastLockHolders > 0) multicastLockHolders--
+        if (multicastLockHolders > 0) return
         val lock = wifiMulticastLock
         wifiMulticastLock = null
         if (lock == null) return

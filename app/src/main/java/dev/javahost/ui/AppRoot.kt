@@ -76,6 +76,7 @@ fun AppRoot(vm: AppViewModel) {
             vm.consumeNavigation()
             return@LaunchedEffect
         }
+        if (request.openConsole) vm.focusConsole(target.id)
         stack = listOf(Route.Home, Route.Detail(target.id)) +
             if (request.openConsole) listOf(Route.Console(target.id)) else emptyList()
         vm.consumeNavigation()
@@ -106,7 +107,10 @@ fun AppRoot(vm: AppViewModel) {
                 onOpenSettings = { push(Route.Settings) },
                 onOpenJre = { push(Route.Jre) },
                 onOpenPowerGuide = { push(Route.PowerGuide) },
-                onOpenConsole = { id -> push(Route.Console(id)) }
+                onOpenConsole = { id ->
+                    vm.focusConsole(id)
+                    push(Route.Console(id))
+                }
             )
 
             Route.Wizard -> WizardScreen(
@@ -148,7 +152,12 @@ fun AppRoot(vm: AppViewModel) {
                         actions = vm,
                         instance = instance,
                         onBack = { pop() },
-                        onConsole = { push(Route.Console(instance.id)) },
+                        // Focus this instance before opening its console so the
+                        // console flow/entries belong to it.
+                        onConsole = {
+                            vm.focusConsole(instance.id)
+                            push(Route.Console(instance.id))
+                        },
                         onFiles = { push(Route.Files(instance.id)) },
                         onProperties = { push(Route.Properties(instance.id)) },
                         onMods = { push(Route.Mods(instance.id)) },
@@ -164,8 +173,8 @@ fun AppRoot(vm: AppViewModel) {
                         state = state,
                         actions = vm,
                         instance = instance,
-                        // The manager keeps a single in-memory session; do not
-                        // show another instance's live lines in this one's console.
+                        // The controller's console flow follows the focused instance;
+                        // only show live lines when this instance is the focused one.
                         entries = if (state.activeInstanceId == instance.id) console else emptyList(),
                         onBack = { pop() },
                         onOpenFiles = { push(Route.Files(instance.id)) }

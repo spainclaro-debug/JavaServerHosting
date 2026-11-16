@@ -16,6 +16,7 @@ import dev.javahost.core.model.PendingJar
 import dev.javahost.core.model.PowerChecks
 import dev.javahost.core.model.ServerInstance
 import dev.javahost.core.model.ServerRuntimeStatus
+import dev.javahost.core.model.ThemeChoice
 import dev.javahost.core.model.UiMessage
 import java.io.File
 
@@ -34,7 +35,20 @@ data class AppUiState(
     ),
     val settings: AppSettings = AppSettings(),
     val instances: List<ServerInstance> = emptyList(),
+    /** Focused instance status (back-compat: console screen / notification target). */
     val runtime: ServerRuntimeStatus = ServerRuntimeStatus(),
+    /** Per-instance live/terminal status; entries survive until the process dies. */
+    val runtimes: Map<String, ServerRuntimeStatus> = emptyMap(),
+    /**
+     * Port -> instance name for every configured instance (Minecraft:
+     * `server.properties server-port`, fallback [ServerInstance.serverPort]/25565;
+     * generic: [ServerInstance.serverPort]). Used for port-conflict warnings.
+     */
+    val portOwners: Map<Int, String> = emptyMap(),
+    /** Port -> instance id, so callers can exclude their own instance. */
+    val portOwnerIds: Map<Int, String> = emptyMap(),
+    /** Instance id -> resolved configured port (for the detail screen warning). */
+    val instancePorts: Map<String, Int> = emptyMap(),
     /**
      * Per instance id: true when a Geyser plugin/mod is installed on disk. Detected
      * independently of a running server so the LAN card can offer the Bedrock bridge
@@ -46,6 +60,8 @@ data class AppUiState(
     val jreJobs: Map<String, JobProgress> = emptyMap(),
     val pendingJar: PendingJar? = null,
     val lastCrash: ExitInfo? = null,
+    /** Instance the [lastCrash] belongs to (newest unexpected exit across all). */
+    val lastCrashInstanceId: String? = null,
     val power: PowerChecks = PowerChecks(),
     val message: UiMessage? = null,
     val importingJar: Boolean = false,
@@ -56,6 +72,21 @@ data class AppUiState(
 ) {
     fun instance(id: String?): ServerInstance? = id?.let { key -> instances.firstOrNull { it.id == key } }
     val activeInstance: ServerInstance? get() = instance(activeInstanceId)
+    /** Number of servers currently starting/running/stopping. */
+    val runningCount: Int get() = runtimes.values.count { it.isActive }
+    /** Runtime of one instance; an empty STOPPED status when it has never run. */
+    fun runtimeFor(id: String): ServerRuntimeStatus = runtimes[id] ?: ServerRuntimeStatus()
+    /** Ids of every instance that currently has an active child JVM. */
+    val activeInstanceIds: List<String>
+        get() = runtimes.values.filter { it.isActive }.mapNotNull { it.instanceId }
+
+    /**
+     * Another instance whose configured port is [port], excluding [exceptInstanceId].
+     * Scans every instance (not just the first one recorded in [portOwners]) so a
+     * port shared by two instances warns symmetrically on both sides.
+     */
+    fun portConflictFor(port: Int, exceptInstanceId: String? = null): ServerInstance? =
+        instances.firstOrNull { it.id != exceptInstanceId && instancePorts[it.id] == port }
     /** True when at least one runtime exists; per-major gating happens on start. */
     val jreReady: Boolean get() = jres.isNotEmpty()
     fun isInstalled(major: Int): Boolean = jres.any { it.major == major }
@@ -107,23 +138,28 @@ interface AppActions {
     fun renameInstance(id: String, name: String)
 
     // --- lifecycle -------------------------------------------------------------
+    /** Start one server (up to [dev.javahost.core.api.ServerController.MAX_RUNNING_SERVERS] may run). */
     fun startServer(id: String)
-    fun stopServer(force: Boolean = false)
-    fun restartServer()
-    /** Immediately kill a wedged server process and clear the session. */
-    fun forceStopServer()
-    fun sendCommand(command: String)
-    fun clearConsole()
-    fun exportConsole(uri: Uri)
+    /** Gracefully stop one server; the other running servers are unaffected. */
+    fun stopServer(id: String, force: Boolean = false)
+    /** Stop then start one server; other running servers are unaffected. */
+    fun restartServer(id: String)
+    /** Immediately kill a wedged server process and clear its session. */
+    fun forceStopServer(id: String)
+    fun sendCommand(instanceId: String, command: String)
+    fun clearConsole(instanceId: String)
+    fun exportConsole(instanceId: String, uri: Uri)
     suspend fun readStartupTail(instanceId: String, lines: Int = 200): List<String>
+    /** Switch the focused instance (console/notification target) without leaving the screen. */
+    fun focusConsole(instanceId: String)
 
     // --- LAN -------------------------------------------------------------------
     /**
-     * Re-resolve the LAN addresses of the running server and TCP-probe each one,
-     * publishing the result to [ServerRuntimeStatus.lan]. No-op (with a message)
-     * when no server is active.
+     * Re-resolve the LAN addresses of one running server and TCP-probe each one,
+     * publishing the result to its [ServerRuntimeStatus.lan]. No-op (with a
+     * message) when that server is not active.
      */
-    fun probeLan()
+    fun probeLan(instanceId: String)
 
     /** Enable/disable the Minecraft LAN discovery announcement for running servers. */
     fun setMinecraftLanDiscovery(enabled: Boolean)
@@ -136,6 +172,8 @@ interface AppActions {
     fun setBedrockLanDiscovery(enabled: Boolean)
 
     // --- settings --------------------------------------------------------------
+    /** Persist the colour theme (applies immediately via MainActivity). */
+    fun setTheme(theme: ThemeChoice)
     fun setDefaultMemory(mb: Int)
     fun setAutoMemoryDefault(enabled: Boolean)
     fun setDefaultJre(major: Int)

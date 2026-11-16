@@ -48,27 +48,36 @@ place.
 └───────────────────────────────────┬──────────────────────────────────────┘
                                     │ ProcessBuilder(java -jar …)
                                     ▼
-                     ┌─────────────────────────────────┐
-                     │ child JVM: java -jar server.jar │
-                     │ workdir = instance directory    │
-                     │ stdout/stderr merged → console  │
-                     └─────────────────────────────────┘
+                 ┌──────────────────────────────────────────────┐
+                 │ up to 5 child JVMs: java -jar server.jar     │
+                 │ workdir = per-instance directory             │
+                 │ stdout/stderr merged → per-instance console  │
+                 └──────────────────────────────────────────────┘
 ```
 
-- Exactly **one child JVM** is hosted at a time. Multiple server instances can
-  exist on disk; starting a second one while the first is active is rejected.
+- Up to **five child JVMs** (`ServerController.MAX_RUNNING_SERVERS = 5`) run at
+  the same time, one per instance. Each has its own process, working directory,
+  console/status/port and `logs/console.log`; the others keep running when one
+  is started, stopped or restarted.
+- `ServerManager` keeps a `runtimes: StateFlow<Map<String, ServerRuntimeStatus>>`
+  with one entry per instance, plus the **focused** `runtime`,
+  `consoleEntries` and `activeInstanceId` that the console screen and the
+  ongoing notification follow. `focus(instanceId)` switches the focused instance
+  and its live console stream.
 - `AppContainer` is a process-wide singleton created by `JavaHostApp`. The
   Activity, ViewModel and foreground service all observe the same
   `ServerManager`, which is what makes console/status survive Activity death.
-- The foreground service owns the lifecycle: it acquires the locks, posts the
-  ongoing notification, calls `ServerManager.start/stop/restart`, and updates
-  the notification from the `runtime` `StateFlow`.
+- The foreground service owns the aggregate lifecycle: it acquires the locks
+  once, posts the ongoing notification (focused server + running count), stays
+  foreground while **any** session is active, calls
+  `start/stop/restart` for the requested instance, and finishes only when no
+  session remains.
 - `onTaskRemoved` deliberately does nothing and the service is
   `stopWithTask="false"`: swiping the app from Recents must not kill a running
-  server. `START_STICKY` lets the service reattach to a child JVM that is still alive
-  in the same app process after the service itself was recreated; after process
-  death the next cold start surfaces the persisted crash instead of pretending
-  the server is still running.
+  server. `START_STICKY` lets the service reattach to child JVMs that are still
+  alive in the same app process after the service itself was recreated; after
+  process death the next cold start surfaces the persisted crash instead of
+  pretending the server is still running.
 
 ### Service lifecycle and stop/start semantics (1.4.0)
 
@@ -78,31 +87,84 @@ manager from `onDestroy()`, so a Stop made the next Start return “JavaHost is
 shutting down.” until the app process was killed):
 
 - **The manager is revivable.** `ServerManager.shutdown()` keeps its contract —
-  kill the child, cancel the coroutine scope, stop the console publisher — but
-  it no longer permanently ends the singleton. `start()`/`restart()` call
+  kill the children, cancel the coroutine scope, stop the console publisher —
+  but it no longer permanently ends the singleton. `start()`/`restart()` call
   `ensureOperational()`, which recreates the scope and console publisher, clears
-  the disposed flag and resets the shutdown latch. `hasActiveSession()` reports
-  whether a child session really exists, independent of the published runtime
-  snapshot.
+  the disposed flag and resets the shutdown latch. `hasActiveSession(instanceId)`
+  and `hasAnyActiveSession()` report whether a real child session exists,
+  independent of the published runtime snapshots.
 - **Idle service teardown does not dispose it.** `onDestroy()` calls
-  `shutdown()` only when a session or active runtime exists. After a normal Stop
-  the service releases its locks/notification and stops; the controller stays
-  usable, so the next Start needs no app restart.
+  `shutdown()` only when `hasAnyActiveSession()` or an active runtime exists.
+  After the last normal Stop the service releases its locks/notification and
+  stops; the controller stays usable, so the next Start needs no app restart.
 - **Start during Stop queues.** `ServiceLifecycleDecisions.decideStart()` is a
   pure, exhaustively unit-tested helper that returns one of `ADOPT_RUNNING`,
   `QUEUE_AFTER_STOP`, `CLEAR_STALE_THEN_START` or `START_FRESH` from the
-  published runtime, its state and `hasActiveSession()`. A queued Start runs
-  immediately after the stop finishes in the same service operation, so the
-  notification moves from “Stopping…” to “Starting…” with no teardown between.
+  published runtime, its state and the session check. It is applied **per
+  instance**; a queued Start runs immediately after that instance's stop in the
+  same service operation, so the notification moves from “Stopping…” to
+  “Starting…” with no teardown between.
 - **Restart is one operation.** `ServiceLifecycleDecisions.decideRestart()` picks
-  `RESTART_EXISTING`, `CLEAR_STALE_THEN_START` or `START_FRESH`; a
+  `RESTART_EXISTING`, `CLEAR_STALE_THEN_START` or `START_FRESH`; a per-instance
   `restartInFlight` guard makes the runtime observer ignore the transient
   terminal state published during a restart, and the service waits (bounded) for
   the new session to become active and stays alive for it.
-- **Stale-state recovery.** If the runtime claims active but
-  `hasActiveSession()` is false, the service calls `forceStop()` (clearing the
-  zombie session and resetting the runtime) and then starts fresh. The manual
-  Force Stop action remains for a genuinely stuck child.
+- **Stale-state recovery.** If a runtime claims active but its session is gone,
+  the service calls the per-instance `forceStop(instanceId)` (clearing the zombie
+  session and resetting the runtime) and then starts fresh. The manual Force Stop
+  action remains for a genuinely stuck child.
+
+## Multi-server model (1.5.0)
+
+- **Sessions and status.** Each instance that runs has a `Session` in
+  `ServerManager` and an entry in the `runtimes` map. `ServerRuntimeStatus` keeps
+  the same fields as before (`instanceId`, state, pid, players/connections,
+  port, heap, LAN, Bedrock) so every screen can show a specific instance; the
+  focused `runtime` is a mirror of `runtimes[activeInstanceId]` for screens that
+  still treat “the” server as focused (console, notification).
+- **Per-instance lifecycle.** `start(instanceId)`, `stop(instanceId, force)`,
+  `restart(instanceId)`, `forceStop(instanceId)`, `sendCommand(instanceId, …)` and
+  the console/log helpers all take an instance id, run asynchronously, and leave
+  other sessions untouched; a restart is serialized per instance. A start is
+  rejected when: the instance is already active, five sessions are already
+  active, or its resolved port is owned by another instance (see below). A
+  successful start focuses the new instance, clears its console buffer and
+  publishes `STARTING`.
+- **Port validation.** `portOwner(port, exceptInstanceId)` returns the name of the
+  instance that owns a port — running or merely configured. The resolved port is
+  computed from `server.properties` `server-port` → `instance.serverPort` →
+  `25565` for Minecraft, and from `instance.serverPort` for generic servers
+  (which may be unknown, in which case only the server's own bind error can
+  report it). `start()` calls `portOwner` and rejects with a message naming the
+  owner and what to change; `AppUiState.portOwners` (computed from the instance
+  list) drives non-blocking warnings on the create screen, the Minecraft
+  `server-port` field and the generic port editor. The guard is a pre-flight
+  check: another app outside JavaHost can still occupy the port, which the bind
+  error classifier reports.
+- **Service aggregation.** One foreground service covers all sessions: it stays
+  foreground while at least one is active, keeps the `WakeLock`/`WifiLock` set
+  for the duration, renders the focused server plus an “N servers running” line,
+  and exposes **Stop focused**, **Restart focused** and **Stop all**
+  (`ACTION_STOP_ALL`). Crash alerts, auto-restart budgets and
+  `manualStopRequested` are tracked per instance, so one server's crash or manual
+  stop does not affect the others; stale-runtime recovery and the restart guard
+  run per instance.
+- **UI.** Home renders one active-server panel per running server (stacked) and
+  removes all active ones from the “Servers” list below (the 1.4.1 de-duplication
+  rule, extended), with an “N running / 5” indicator; tapping a panel focuses
+  that server. Instance-specific screens (server detail, console) use
+  `runtimeFor(id)` rather than the focused runtime, and opening a console focuses
+  that instance. `state.runtime` remains the focused runtime for back-compat.
+- **Bedrock bridge is single-owner.** UDP `19132`/`19133` and the Geyser port
+  move are process-global, so only the first running Minecraft session that
+  requests the bridge (setting on + Geyser installed) can own it. Later
+  Minecraft+Geyser sessions log a warning on their LAN card/console and keep
+  running their Java server without the Bedrock bridge. Java LAN discovery is
+  per session: each running Minecraft server announces its own port on multicast
+  `224.0.2.60:4445`.
+- **Power.** One foreground service and one lock set cover all sessions, but CPU,
+  RAM and heat scale with the number of JVMs; the per-server heap limit is
+  enforced individually and the total is not reserved.
 
 ## Directory layout
 
@@ -200,12 +262,17 @@ classification manually; detection is a convenience, not a gate.
 
 ## Server lifecycle
 
-`ServerManager` states: `STOPPED → STARTING → RUNNING → STOPPING → STOPPED`,
-with `CRASHED` for an unexpected exit. On start it:
+`ServerManager` hosts up to five concurrent sessions and each instance follows
+its own `STOPPED → STARTING → RUNNING → STOPPING → STOPPED` state machine (with
+`CRASHED` for an unexpected exit); the focused instance's state is mirrored into
+`runtime`. On start, per instance:
 
 - validates JRE presence/executable, JAR containment, EULA (Minecraft only) and
   memory, resolving auto-memory from `ActivityManager.MemoryInfo` (conservative:
   ~45% of RAM capped at 2 GB by default);
+- validates the session limit (`MAX_RUNNING_SERVERS = 5`), that the instance is
+  not already active, and that its resolved port is not owned by another
+  configured/running instance (`portOwner`, naming the owner in the rejection);
 - writes the launch command with `ProcessBuilder(List<String>)` (no shell):
   `-Xms/-Xmx`, headless, UTF-8, `user.home`, JNA path when needed, user JVM
   args, `-jar`, then `nogui` for Minecraft or the free-text args for generic
@@ -218,15 +285,15 @@ with `CRASHED` for an unexpected exit. On start it:
 - computes uptime, heap (`jcmd GC.heap_info`, falling back to `/proc/<pid>/status`
   RSS) and device free RAM every few seconds.
 
-Graceful stop sends `stop` to Minecraft servers and allows up to
-`GRACEFUL_STOP_MAX_MS = 8 s` for the world save and exit, then `SIGTERM` with a
-`KILL_GRACE_MS = 2 s` grace, then `SIGKILL` (pid-level `Os.kill` plus the
-platform `Process` API) — worst case ~11 s, normally under 2 s. Generic servers
-are terminated after a short grace period because arbitrary JARs do not share a
-stop protocol. Unexpected exits are classified (OOM, port already in use,
-unsupported class version, missing library, EULA, signal 137 / system kill,
-unknown), written to `crashes/`, persisted on the instance, and surfaced in the
-UI and in a notification with a restart action.
+Graceful stop is per instance and sends `stop` to Minecraft servers, allowing up
+to `GRACEFUL_STOP_MAX_MS = 8 s` for the world save and exit, then `SIGTERM` with
+a `KILL_GRACE_MS = 2 s` grace, then `SIGKILL` (pid-level `Os.kill` plus the
+platform `Process` API) — worst case ~11 s, normally under 2 s. Other sessions
+keep running. Generic servers are terminated after a short grace period because
+arbitrary JARs do not share a stop protocol. Unexpected exits are classified
+(OOM, port already in use, unsupported class version, missing library, EULA,
+signal 137 / system kill, unknown), written to `crashes/`, persisted on the
+instance, and surfaced in the UI and in a notification with a restart action.
 
 ## LAN access & discovery
 
@@ -288,7 +355,8 @@ port `4445`, with the payload
 
 Dedicated servers do not send this. When the **Minecraft LAN discovery
 announcement** toggle is on (default), JavaHost sends that datagram every
-`INTERVAL_MS = 1500` ms for the running Minecraft server: TTL 1, socket bound to
+`INTERVAL_MS = 1500` ms for **each running Minecraft session** (per-session
+announcer with its own port): TTL 1, socket bound to
 an ephemeral port, `setNetworkInterface` pointing at the preferred LAN interface
 when possible, and a `WifiManager` `MulticastLock` taken when the platform allows
 it. The lock is a receive-side optimisation: sending multicast only needs
@@ -451,9 +519,14 @@ leaves those values alone — RakNet was the default there.
 
 ### Lifecycle and status
 
-The bridge applies only to Minecraft instances whose `plugins/` contains a
-Geyser JAR, when **Bedrock LAN bridge (Geyser)** is on (default). It is evaluated
-at server start/restart because Geyser's listen port is fixed at JVM launch.
+The bridge is **single-owner** across the app: UDP `19132`/`19133` and the
+Geyser config patch are process-global, so it applies only to the first running
+Minecraft session whose `plugins/` contains a Geyser JAR while **Bedrock LAN
+bridge (Geyser)** is on (default). It is evaluated at server start/restart
+because Geyser's listen port is fixed at JVM launch. A later Minecraft+Geyser
+session is warned (console and LAN card) and keeps running its Java server
+without the Bedrock bridge; with up to five JVMs this means one Bedrock-bridged
+server at a time.
 Once the server is ready, the app starts the relay, pings Geyser over RakNet
 every few seconds, and publishes `BedrockLanStatus` (relay running, bound port,
 Geyser reachable, MOTD/version/protocol/players, per-interface bridge
@@ -498,12 +571,13 @@ discovery is not implemented.
 
 ## Persistence stack
 
-- `foreground service` (specialUse) + ongoing notification
-- partial `WakeLock` + `WifiLock` held only while the JVM runs
+- `foreground service` (specialUse) + ongoing notification, one service covering
+  all sessions and staying foreground while any child JVM runs
+- partial `WakeLock` + `WifiLock` held while any JVM runs (one lock set)
 - user-granted battery-optimization exemption (deep link + fallback)
 - guided Phantom Process Killer disabling on Android 12+ (generic walkthrough,
   copyable ADB commands, no hardcoded OEM menu paths)
-- continuous log mirror + crash reports
+- continuous per-instance log mirror + crash reports
 
 A near-silent looping `MediaPlayer` is implemented as an in-app toggle (default
 off, applies live, compiled behind `BuildConfig.ENABLE_SILENT_MEDIA_HACK` so it
@@ -519,32 +593,53 @@ navigation-compose dependency). Screens are stateless and receive an
 `StateFlow<List<ConsoleEntry>>` so log traffic does not recompose every screen.
 
 Flow: first-run wizard (runtime, notifications/battery, phantom-killer guidance,
-optional Minecraft EULA) → home (instance list, active-server card) → create
-(SAF JAR import, detection, memory/JRE/args, EULA) → detail (controls, live
-stats, crash post-mortem) → console / files / server.properties / Modrinth
-plugins-mods. Generic instances hide Minecraft-only screens and instead expose
-the working-directory browser, raw JVM args and server args.
+optional Minecraft EULA) → home (instance list, one active-server card per
+running server) → create (SAF JAR import, detection, memory/JRE/args, EULA) →
+detail (controls, live stats, crash post-mortem) → console / files /
+server.properties / Modrinth plugins-mods. Generic instances hide
+Minecraft-only screens and instead expose the working-directory browser, raw JVM
+args and server args. Instance-specific screens read their own
+`runtimeFor(id)`; opening a console or tapping a Home active card focuses that
+instance for the console/notification.
 
-### Theme palette (1.4.0)
+### Theme system (1.5.0)
 
-Two Material 3 schemes selected by the system dark-mode setting:
+Themes are a user setting (`AppSettings.theme`, a `ThemeChoice` enum) applied
+immediately by `MainActivity` (`JavaHostTheme(state.settings.theme)`):
 
-- **Dark (unchanged):** ink background (`#0C1116`), teal accent (`#2BD4A8`) and
-  the previous surface/text greys.
-- **Light (new):** warm cream background `#F0E4C8`, surface `#F6ECD8` (lighter
-  so cards separate), brown **accent/primary `#5A4C39`**, cream `onPrimary`
-  `#F7EFDD`, primary container `#E7D9BE` with `onPrimaryContainer` `#3B3123`,
-  dark-brown `onBackground`/`onSurface` `#2E261B`, `surfaceVariant` `#E3D3B4`,
-  `onSurfaceVariant` `#5C4E3C`, secondary `#7A6A52`, outline `#9C8A6E` and the
-  standard error red `#B3261E` with white `onError`.
-- **Active-server accent:** `StatePill` for `RUNNING` uses
-  `MaterialTheme.colorScheme.primary`, so it is the brown accent in light mode
-  and teal in dark mode. `SectionCard` gained optional
-  `containerColor`/`borderColor` parameters (2 dp border when set, default call
-  sites unchanged), used by the active server card, the active instance card and
-  the active server's status card (`primaryContainer` + `primary` border). The
-  theme never hardcodes the light brown outside the light scheme, so dark mode
-  keeps its teal accent and every screen stays readable.
+- **`SYSTEM`** follows the device dark mode; **`LIGHT`** is the 1.4.0 cream
+  palette (background `#F0E4C8`, accent `#5A4C39`); **`DARK`** is the existing
+  ink/teal palette.
+- **`MATERIAL_YOU`** uses `dynamicLight/DarkColorScheme(context)` on Android 12
+  (API 31)+ and falls back to `SYSTEM` when dynamic colour is unavailable.
+- Four custom palettes plus High Contrast Black, each with a light and a dark
+  variant. Palette hexes are primary / secondary / tertiary:
+
+  | Theme | Primary | Secondary | Tertiary |
+  |---|---|---|---|
+  | Monochromatic Blue | `#1A73E8` | `#4A90D9` | `#E8F0FE` |
+  | Energy | `#2C3E50` | `#E67E22` | `#F1C40F` |
+  | Triadic | `#00B4DB` | `#FF6B6B` | `#F9CA24` |
+  | Analog Green | `#27AE60` | `#2980B9` | `#1ABC9C` |
+  | High Contrast Black | `#000000` | `#FFC107` | `#FFFFFF` |
+
+- **Pure-JVM palette table:** `core/model/ThemePalette.kt` defines the
+  `ThemePalette` data class (primary/onPrimary/secondary/onSecondary/tertiary/
+  onTertiary plus light and dark background/surface/onBackground) and
+  `ThemePalettes.palette(choice)`, which returns `null` for `SYSTEM` and
+  `MATERIAL_YOU`. `ThemePalettesTest` asserts every hex value and that all
+  `ThemeChoice` values are covered.
+- **Compose mapping:** `ui/theme/ThemeCatalog.colorScheme(choice, darkTheme,
+  context)` turns a palette into a Material 3 `ColorScheme` (deriving containers
+  and outline), keeps the built-in cream/dark schemes for LIGHT/DARK/SYSTEM,
+  and builds dynamic schemes for Material You. `javaHostStatusColors()` keeps
+  the status colours readable for every palette (luminance-based light/dark
+  variants for custom themes; the existing values for LIGHT/DARK/SYSTEM).
+- **Active accent:** the active-server card, `RUNNING` status pill and active
+  status card use `MaterialTheme.colorScheme.primary` (with `primaryContainer`
+  and a 2 dp `primary` border), so they follow whichever theme is selected.
+  `SectionCard` keeps its optional `containerColor`/`borderColor` parameters used
+  for that treatment.
 
 ## Security & privacy
 

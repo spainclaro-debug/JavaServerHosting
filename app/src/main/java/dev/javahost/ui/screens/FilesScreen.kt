@@ -114,7 +114,7 @@ fun FilesScreen(
     var editor by remember { mutableStateOf<EditorState?>(null) }
     var pendingExport by remember { mutableStateOf<FileEntry?>(null) }
 
-    val running = state.runtime.instanceId == instance.id && state.runtime.state == RunState.RUNNING
+    val running = state.runtimeFor(instance.id).state == RunState.RUNNING
 
     LaunchedEffect(instance.id, currentDir, refreshKey) {
         loading = true

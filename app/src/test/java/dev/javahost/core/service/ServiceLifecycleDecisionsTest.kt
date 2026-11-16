@@ -2,13 +2,17 @@ package dev.javahost.core.service
 
 import dev.javahost.core.model.RunState
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * Exhaustive truth table for the foreground service's Stop/Start/Restart
- * transition rules. Hermetic: no Android framework, no coroutines, no I/O.
+ * Exhaustive truth table for the foreground service's per-instance Stop/Start/
+ * Restart transition rules plus the multi-session keep-alive/focus helpers.
+ * Hermetic: no Android framework, no coroutines, no I/O.
  *
- * The table is deliberately written out row by row (every combination of
+ * The tables are deliberately written out row by row (every combination of
  * "runtime claims active", published state including the null fallback, and
  * "a real session exists") so a future change to [ServiceLifecycleDecisions]
  * cannot silently alter behaviour.
@@ -138,6 +142,96 @@ class ServiceLifecycleDecisionsTest {
             RestartDecision.RESTART_EXISTING,
             ServiceLifecycleDecisions.decideRestart(true, RunState.CRASHED, true)
         )
+    }
+
+    @Test
+    fun `the service is only allowed to finish when nothing is active or pending`() {
+        // Full 2x2x2 truth table for the multi-session keep-alive rule.
+        for (activeRuntime in listOf(false, true)) {
+            for (activeSession in listOf(false, true)) {
+                for (pendingWork in listOf(false, true)) {
+                    val expected = activeRuntime || activeSession || pendingWork
+                    assertEquals(
+                        "shouldKeepServiceAlive(activeRuntime=$activeRuntime, " +
+                            "activeSession=$activeSession, pendingWork=$pendingWork)",
+                        expected,
+                        ServiceLifecycleDecisions.shouldKeepServiceAlive(
+                            anyActiveRuntime = activeRuntime,
+                            anyActiveSession = activeSession,
+                            hasPendingWork = pendingWork
+                        )
+                    )
+                }
+            }
+        }
+        // Regression guard for the "one instance's stop must not tear down the
+        // others" rule.
+        assertTrue(
+            ServiceLifecycleDecisions.shouldKeepServiceAlive(
+                anyActiveRuntime = true,
+                anyActiveSession = false,
+                hasPendingWork = false
+            )
+        )
+        assertTrue(
+            ServiceLifecycleDecisions.shouldKeepServiceAlive(
+                anyActiveRuntime = false,
+                anyActiveSession = true,
+                hasPendingWork = false
+            )
+        )
+        assertTrue(
+            ServiceLifecycleDecisions.shouldKeepServiceAlive(
+                anyActiveRuntime = false,
+                anyActiveSession = false,
+                hasPendingWork = true
+            )
+        )
+        assertFalse(
+            ServiceLifecycleDecisions.shouldKeepServiceAlive(
+                anyActiveRuntime = false,
+                anyActiveSession = false,
+                hasPendingWork = false
+            )
+        )
+    }
+
+    @Test
+    fun `notification focus prefers the focused instance while it is active`() {
+        assertEquals(
+            "focused",
+            ServiceLifecycleDecisions.resolveFocusedInstanceId("focused", listOf("alpha", "focused"))
+        )
+        // Single active instance.
+        assertEquals(
+            "alpha",
+            ServiceLifecycleDecisions.resolveFocusedInstanceId("alpha", listOf("alpha"))
+        )
+    }
+
+    @Test
+    fun `notification focus falls back to the first active instance in stable order`() {
+        // No focus yet.
+        assertEquals(
+            "alpha",
+            ServiceLifecycleDecisions.resolveFocusedInstanceId(null, listOf("zulu", "alpha"))
+        )
+        // Focus points at a stopped instance that is no longer active.
+        assertEquals(
+            "alpha",
+            ServiceLifecycleDecisions.resolveFocusedInstanceId("stopped", listOf("zulu", "alpha"))
+        )
+        // Blank focus is treated as absent.
+        assertEquals(
+            "alpha",
+            ServiceLifecycleDecisions.resolveFocusedInstanceId("   ", listOf("alpha"))
+        )
+    }
+
+    @Test
+    fun `notification focus is null when nothing is active`() {
+        assertNull(ServiceLifecycleDecisions.resolveFocusedInstanceId(null, emptyList()))
+        assertNull(ServiceLifecycleDecisions.resolveFocusedInstanceId("zombie", emptyList()))
     }
 
     private data class Row<T>(

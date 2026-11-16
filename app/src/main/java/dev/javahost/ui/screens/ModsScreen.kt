@@ -125,7 +125,7 @@ fun ModsScreen(
     var versionsError by remember { mutableStateOf<String?>(null) }
     var installingVersionId by remember { mutableStateOf<String?>(null) }
 
-    val running = state.runtime.instanceId == instance.id && state.runtime.state == RunState.RUNNING
+    val running = state.runtimeFor(instance.id).state == RunState.RUNNING
     val folder = folderFor(target)
 
     LaunchedEffect(instance.id, target, installedRefresh) {

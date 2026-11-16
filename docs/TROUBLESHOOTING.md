@@ -1,5 +1,13 @@
 # Troubleshooting
 
+## Upgrading from 1.4.1
+
+The JavaHost 1.5.0 APK is signed with the same development key as 1.4.1 and
+installs as an **in-place upgrade**: instances, worlds, plugins, settings and the
+installed JRE are kept, and existing single-server setups behave the same. There
+is nothing to migrate: the theme picker starts on **System**, and up to five
+servers can now run at the same time.
+
 ## Upgrading from 1.3.0
 
 The JavaHost 1.4.0 APK is signed with the same development key as 1.3.0 and
@@ -27,6 +35,60 @@ installed JRE and settings (including the new LAN discovery toggle) are kept. If
 you installed a build signed with a different key, Android will refuse the
 update; back up the instance working directories before uninstalling.
 
+## “I can't start a second server / port already in use”
+
+JavaHost can run **up to 5 servers at once**, and every running server must use a
+different port. Start is rejected in these cases:
+
+- **A sixth server.** Stop one first — on the server screen, from the ongoing
+  notification (**Stop focused** / **Stop all**) or from a Home active-server
+  card.
+- **The same port twice.** The rejection message names the server that already
+  owns the port. Minecraft: edit **Properties → server-port** (25565 by default)
+  to a free port such as 25566 or 25567. Generic Java servers: change the
+  instance's port / server args (for example `--port 18082`). The create screen
+  and both port fields warn before you start when another instance already owns
+  the port.
+- **Another app outside JavaHost owns the port.** The guard only sees JavaHost
+  instances; if another app or a stale process holds it, the JVM's bind error
+  (“Address already in use”) is classified and shown in the crash report. Stop
+  the other process and start again.
+- **Bedrock bridge conflict:** the Bedrock/Geyser LAN bridge is single-server.
+  The first running Minecraft+Geyser session owns UDP 19132; a later one is
+  warned and keeps running its Java server without the Bedrock bridge. Run one
+  Bedrock-bridged server at a time.
+
+## “Running several servers: memory, battery and heat”
+
+Each running server is a separate JVM with its own configured heap, so five
+servers need the sum of their heaps plus Android. JavaHost enforces the limit
+per server but does not reserve the total:
+
+- use **512–1024 MB heaps** for small worlds/servers — the heap slider is per
+  instance;
+- check **Home → Device** for free RAM and leave headroom for Android;
+- keep the battery-optimization exemption and the Phantom Process Killer guidance
+  (power guide) — they matter more with several JVMs;
+- expect slower startup, more heat and heavier battery drain; stop unused
+  servers with **Stop all**, and prefer one or two servers on 6–8 GB phones;
+- if the system kills one JVM, its crash reason/report is per instance and the
+  other servers keep running — restart just that one.
+
+## “The theme doesn't change / Material You falls back to System”
+
+**Settings → Appearance** selects System, Light, Dark, Material You, or one of
+the custom palettes (Monochromatic Blue, Energy, Triadic, Analog Green, High
+Contrast Black). Changes apply immediately.
+
+- **Material You requires Android 12+ with dynamic colour support.** On older
+  versions or ROMs without dynamic colour it deliberately falls back to the
+  system look — pick Light or Dark explicitly for a fixed theme.
+- **System** follows the device dark-mode setting. Custom themes have light and
+  dark variants, so changing device mode keeps the chosen palette.
+- If only some accents look off, re-select the theme (or System). Status colours
+  are adjusted for readability and are not customisable; report a screenshot if
+  any text is unreadable.
+
 ## “Stopping the server never finishes / notification keeps saying Shutting down”
 
 Fixed for good in **1.4.0** (on top of the 1.1.2/1.1.3 hardening). How Stop works
@@ -47,6 +109,11 @@ now:
 5. If the runtime looks active but the child session is gone (stale state after a
    ROM kill), the app clears it automatically with an internal force-stop and
    starts fresh.
+6. **Several servers at once:** the notification shows the focused server plus an
+   “N servers running” line — **Stop focused**/**Restart focused** act on that
+   server, **Stop all** stops every session, and one server stopping or crashing
+   does not affect the others. Use the Home active-server cards to switch the
+   focused server.
 
 **If it still happens on 1.4.0+:**
 
@@ -156,10 +223,12 @@ example mobile-data-only). Connect it to Wi-Fi/hotspot first.
 Work through this order; each step is cheap and the app now surfaces most of
 them. The server itself may be perfectly healthy while the network blocks it.
 
-1. **Use the exact address from the server's LAN card.** The card shows the
+1. **Use the exact address from the right server's LAN card.** The card shows the
    interface label (`Wi-Fi`, `Ethernet`, `Hotspot`) and `address:port`; use the
    copy button. If several addresses are listed, try each — only one may be the
-   network the client is on.
+   network the client is on. With several servers running, each has its **own**
+   LAN card/port: open the server you want to connect to (its screen shows
+   `runtimeFor(id)`) and use that address.
 2. **Clear the bind address (`server-ip`).** A loopback value such as
    `127.0.0.1` makes the server reachable only from the phone. 1.2.0 clears a
    loopback bind before start and the **Properties → Bind address (server-ip)**
@@ -217,6 +286,12 @@ itself. Requirements:
 4. Client and phone on the **same Wi-Fi/hotspot**, no VPN and no mobile-data-only
    phone. AP/client isolation, guest networks and router broadcast filtering
    still block **discovery** (see the end of this section).
+5. **Only one Minecraft+Geyser server can own the Bedrock bridge at a time.**
+   UDP 19132/19133 and the Geyser port move are process-global: the first running
+   Minecraft session with Geyser gets the bridge, and any later one is warned on
+   its LAN card/console and keeps running its Java server without Bedrock
+   discovery. Use one Bedrock-bridged server at a time; other servers are still
+   joinable from Java Edition.
 
 **What the LAN card should show when it works:** a **Bedrock Edition** block with
 the bridge address `<phone-ip>:19132` **and** Geyser's direct address
@@ -320,11 +395,12 @@ servers. If you are on an older build, update JavaHost.
 ## “Stop is stuck / I had to force-stop the app”
 
 See **“Stopping the server never finishes / notification keeps saying Shutting
-down”** above for how Stop works in 1.4.0. **Force stop** on the server screen
-or the ongoing notification kills the JVM by PID and clears the session without
-killing the whole app; in 1.4.0 it is only needed for a genuinely wedged child.
-A normal Stop leaves the app able to Start again immediately, and Restart
-recovers on its own — no app restart is required.
+down”** above for how Stop works since 1.4.0. **Force stop** on the server screen
+(where the notification offers it, for the focused server) kills that JVM by PID
+and clears its session without killing the whole app; it only affects that
+server, so other running servers keep going. In 1.4.0+ it is only needed for a
+genuinely wedged child. A normal Stop leaves the app able to Start again
+immediately, and Restart recovers on its own — no app restart is required.
 
 ## “The server appears in my Minecraft server list but I cannot join”
 

@@ -4,14 +4,20 @@ import android.Manifest
 import android.os.Build
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -21,9 +27,13 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import dev.javahost.BuildConfig
+import dev.javahost.core.model.ThemeChoice
+import dev.javahost.core.model.ThemePalettes
 import dev.javahost.ui.AppActions
 import dev.javahost.ui.AppUiState
 import dev.javahost.ui.PowerAction
@@ -115,6 +125,24 @@ fun SettingsScreen(
                 OutlinedButton(onClick = onOpenJre, modifier = Modifier.fillMaxWidth()) {
                     Text("Manage Java runtimes")
                 }
+            }
+
+            /* ---------------- Appearance ---------------- */
+            SectionCard(title = "Appearance", subtitle = "Colour theme") {
+                ThemeChoice.entries.forEach { choice ->
+                    ThemePickerRow(
+                        choice = choice,
+                        selected = settings.theme == choice,
+                        onSelect = { actions.setTheme(choice) }
+                    )
+                }
+                Text(
+                    "Material You uses Android 12+ dynamic colours and falls back to System on " +
+                        "older versions. The theme applies immediately; the active server keeps using " +
+                        "the theme's accent colour.",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
             }
 
             /* ---------------- Reliability ---------------- */
@@ -330,3 +358,66 @@ fun SettingsScreen(
         }
     }
 }
+
+/* -------------------------------------------------------------------------- */
+/* Theme picker pieces                                                         */
+/* -------------------------------------------------------------------------- */
+
+@Composable
+private fun ThemePickerRow(choice: ThemeChoice, selected: Boolean, onSelect: () -> Unit) {
+    val dots = themePreviewDots(choice)
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(10.dp))
+            .clickable(onClick = onSelect),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        RadioButton(selected = selected, onClick = onSelect)
+        Column(modifier = Modifier.weight(1f)) {
+            Text(themeLabel(choice), style = MaterialTheme.typography.bodyLarge)
+            if (choice == ThemeChoice.MATERIAL_YOU) {
+                Text(
+                    "Android 12+; falls back to System",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        }
+        Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+            dots.forEach { dot ->
+                Box(
+                    modifier = Modifier
+                        .size(14.dp)
+                        .clip(RoundedCornerShape(50))
+                        .background(dot)
+                )
+            }
+        }
+    }
+}
+
+/** Primary/secondary/tertiary preview dots; SYSTEM/MATERIAL_YOU use the live scheme. */
+@Composable
+private fun themePreviewDots(choice: ThemeChoice): List<Color> {
+    val palette = ThemePalettes.palette(choice)
+        ?: return listOf(
+            MaterialTheme.colorScheme.primary,
+            MaterialTheme.colorScheme.secondary,
+            MaterialTheme.colorScheme.tertiary
+        )
+    return listOf(Color(palette.primary), Color(palette.secondary), Color(palette.tertiary))
+}
+
+private fun themeLabel(choice: ThemeChoice): String = when (choice) {
+    ThemeChoice.SYSTEM -> "Follow system"
+    ThemeChoice.LIGHT -> "Light (cream)"
+    ThemeChoice.DARK -> "Dark (teal)"
+    ThemeChoice.MATERIAL_YOU -> "Material You"
+    ThemeChoice.MONOCHROMATIC_BLUE -> "Monochromatic Blue"
+    ThemeChoice.ENERGY -> "Energy"
+    ThemeChoice.TRIADIC -> "Triadic"
+    ThemeChoice.ANALOG_GREEN -> "Analog Green"
+    ThemeChoice.HIGH_CONTRAST_BLACK -> "High Contrast Black"
+}
+

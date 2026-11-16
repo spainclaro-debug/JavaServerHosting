@@ -14,10 +14,10 @@ import dev.javahost.core.model.BedrockLanStatus
 import dev.javahost.core.model.ConsoleEntry
 import dev.javahost.core.model.ExitInfo
 import dev.javahost.core.model.ExitReason
+import dev.javahost.core.model.InspectionResult
 import dev.javahost.core.model.LanEndpointInfo
 import dev.javahost.core.model.LanProbeInfo
 import dev.javahost.core.model.LanStatus
-import dev.javahost.core.model.InspectionResult
 import dev.javahost.core.model.LogLevel
 import dev.javahost.core.model.RunState
 import dev.javahost.core.model.ServerFlavor
@@ -56,48 +56,51 @@ import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import java.io.File
 import java.net.DatagramPacket
 import java.net.DatagramSocket
-import java.net.Inet4Address
 import java.net.InetAddress
-import java.net.NetworkInterface
 import java.time.Instant
+import java.util.Collections
 import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 
 /**
- * The single child-JVM host of the app.
+ * Hosts up to [ServerController.MAX_RUNNING_SERVERS] child JVMs at the same
+ * time, one per server instance.
  *
- * Owns the only Java server process the app may run, its stdin/stdout, the
- * in-memory console, the on-disk log tail and the crash post-mortem.  It is a
- * process-wide singleton created by [dev.javahost.AppContainer] and shared by
- * the Compose UI (through the ViewModel) and the foreground service, so it never
- * touches Android UI classes and does not care whether the Activity is alive.
+ * Each instance gets its own session (process, stdin/stdout reader, on-disk log
+ * tail, crash post-mortem, LAN announcement and — for the single Bedrock bridge
+ * owner — UDP 19132 relay). The focused instance is what the console screen and
+ * the ongoing notification show; [runtimes] and [consoleEntries] are always
+ * scoped to it while [runtimes] carries every instance's live/terminal status.
  *
  * Lifecycle rules:
- *  - exactly one child JVM at a time; [start] rejects while a process exists or
- *    another start/stop/restart transition is in flight,
- *  - [start] is synchronous (spawns immediately) and safe from a background
- *    thread; the service calls it from an FGS action,
- *  - [stop] launches the graceful shutdown asynchronously (the notification
- *    action must return quickly and the UI may already be dead),
- *  - [restart] is asynchronous and serialized with start/stop by a [Mutex],
- *  - [shutdown] kills the child synchronously-ish (destroyForcibly) and cancels
- *    all coroutines so the service can die without leaking a JVM.
+ *  - [start] is synchronous (spawns immediately), validates JRE/EULA/JAR/Port
+ *    before spawning and rejects when 5 sessions are already active, when the
+ *    instance is already active, or when another instance (running or merely
+ *    configured) resolves to the same port;
+ *  - [stop] is asynchronous and per-instance: the other servers keep running;
+ *  - [restart] is asynchronous, serialized per instance, and never touches the
+ *    other sessions;
+ *  - [shutdown] kills every child process and cancels all coroutines.
  *
- * "Unexpected" exits go through the crash post-mortem: classify, save
- * `crashes/crash-<ts>.txt` + `crashes/last-crash.txt`, persist exit fields via
- * [InstanceStore] and publish a [RunState.CRASHED] runtime with [ExitInfo].
+ * The Bedrock LAN bridge (UDP 19132 -> Geyser on UDP 19133) can only have one
+ * owner because the app can bind UDP 19132 once. The first eligible Minecraft
+ * session owns it; other Minecraft+Geyser sessions get a unique internal Geyser
+ * port (19140+slot / 19145+slot) and a console warning telling the user to add
+ * that address manually in Bedrock.
+ *
+ * "Unexpected" exits go through the crash post-mortem per session: classify,
+ * save `crashes/crash-<ts>.txt` + `crashes/last-crash.txt`, persist exit fields
+ * via [InstanceStore] and publish a [RunState.CRASHED] entry for that instance.
  *
  * The constructor signature is fixed by the team contract; do not change it.
  */
@@ -119,27 +122,44 @@ class ServerManager(
      */
     @Volatile
     private var scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-    private val lifecycleMutex = Mutex()
     private val lock = Any()
 
     @Volatile
     private var disposed = false
     private val shutdownOnce = AtomicBoolean(false)
 
-    @Volatile
-    private var lastCrash: ExitInfo? = null
+    // ---- multi-session lifecycle state ----------------------------------
+    /** Active sessions keyed by instance id; guarded by [lock]. */
+    private val sessions = LinkedHashMap<String, Session>()
 
-    private val initialStatus: ServerRuntimeStatus = recoverInitialStatus()
-    private val _runtime = MutableStateFlow(initialStatus)
+    /** In-flight restart jobs keyed by instance id; guarded by [lock]. */
+    private val restartJobs = LinkedHashMap<String, Job>()
+
+    /** Instance that owns the single Bedrock LAN bridge (UDP 19132); guarded by [lock]. */
+    private var bedrockOwnerId: String? = null
+
+    /** Instances with an in-flight manual LAN probe. */
+    private val probeInFlight: MutableSet<String> = Collections.synchronizedSet(HashSet())
+
+    // ---- per-instance runtime status ------------------------------------
+    private val initialRuntimes: Map<String, ServerRuntimeStatus> = recoverInitialRuntimes()
+    private val initialFocusedId: String? = settings.current().lastActiveInstanceId
+
+    private val _runtimes = MutableStateFlow(initialRuntimes)
+    override val runtimes: StateFlow<Map<String, ServerRuntimeStatus>> = _runtimes.asStateFlow()
+
+    private val _focusedId = MutableStateFlow(initialFocusedId)
+    override val activeInstanceId: StateFlow<String?> = _focusedId.asStateFlow()
+
+    /** Focused instance status (back-compat for "the" console/notification). */
+    private val _runtime = MutableStateFlow(
+        initialFocusedId?.let { initialRuntimes[it] } ?: ServerRuntimeStatus()
+    )
     override val runtime: StateFlow<ServerRuntimeStatus> = _runtime.asStateFlow()
 
-    private val _activeInstanceId =
-        MutableStateFlow(initialStatus.instanceId ?: settings.current().lastActiveInstanceId)
-    override val activeInstanceId: StateFlow<String?> = _activeInstanceId.asStateFlow()
-
-    // ---- console ---------------------------------------------------------
+    // ---- console -------------------------------------------------------
     private val consoleLock = Any()
-    private val consoleBuffer = ArrayDeque<ConsoleEntry>()
+    private val consoleBuffers = ConcurrentHashMap<String, ArrayDeque<ConsoleEntry>>()
     private val seq = AtomicLong(0L)
     private val consoleDirty = AtomicBoolean(false)
 
@@ -150,7 +170,7 @@ class ServerManager(
     private val _consoleEntries = MutableStateFlow<List<ConsoleEntry>>(emptyList())
     override val consoleEntries: StateFlow<List<ConsoleEntry>> = _consoleEntries.asStateFlow()
 
-    /** Live console stream for consumers that prefer deltas over snapshots. */
+    /** Live console stream of the focused instance for consumers that prefer deltas. */
     private val _consoleLive = MutableSharedFlow<ConsoleEntry>(
         extraBufferCapacity = 512,
         onBufferOverflow = BufferOverflow.DROP_OLDEST
@@ -173,34 +193,31 @@ class ServerManager(
         }
     }
 
-    // ---- lifecycle state -------------------------------------------------
-    @Volatile
-    private var session: Session? = null
-
-    private var restartJob: Job? = null
-
-    // ---- LAN access / Minecraft discovery --------------------------------
+    // ---- LAN access / Minecraft discovery -------------------------------
     private val lanInfo = AndroidLanInfo(appContext)
     private val tcpProbe: TcpProbe = SocketTcpProbe()
-    private var lanAnnouncer: MinecraftLanAnnouncer? = null
-    private val lanProbeInFlight = AtomicBoolean(false)
-
-    // ---- Bedrock Edition bridge (Geyser on 19133, app on 19132) ----------
-    @Volatile
-    private var bedrockRelay: BedrockLanRelay? = null
     private val bedrockClientGuid = kotlin.random.Random.nextLong()
 
     /**
-     * What the Bedrock bridge needs for one launch: whether it applies, whether a
-     * Geyser plugin was found, the config file it may patch, and the environment
-     * overrides passed to the child JVM.
+     * What the Bedrock bridge/relocation needs for one launch: whether this
+     * session owns the LAN bridge, whether Geyser was detected, the config file
+     * that may be patched, the environment overrides passed to the child JVM and
+     * the internal RakNet/WebRTC ports Geyser will use.
      */
     private data class BedrockBridgePlan(
         val requested: Boolean,
         val geyserDetected: Boolean,
         val geyserConfig: File?,
-        val environment: Map<String, String>
+        val environment: Map<String, String>,
+        val geyserInternalPort: Int,
+        val webrtcPort: Int
     )
+
+    /** Geyser detection result for one instance. */
+    private data class GeyserDetection(val config: File?, val detected: Boolean)
+
+    /** Unique internal ports reserved for a non-owner Minecraft+Geyser session. */
+    private data class BedrockPorts(val raknetPort: Int, val webrtcPort: Int)
 
     // =====================================================================
     // Contract: start
@@ -218,47 +235,62 @@ class ServerManager(
             if (!disposed) return
             disposed = false
             shutdownOnce.set(false)
-            restartJob?.cancel()
-            restartJob = null
+            for (job in restartJobs.values) job.cancel()
+            restartJobs.clear()
             scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
         }
         startConsolePublisher()
     }
 
-    override fun hasActiveSession(): Boolean = synchronized(lock) { session != null }
-
     override fun start(instanceId: String): StartResult {
         ensureOperational()
-        if (!lifecycleMutex.tryLock()) {
-            return StartResult.Rejected("Another start/stop/restart operation is still in progress. Try again in a moment.")
-        }
-        try {
-            synchronized(lock) {
-                if (disposed) return StartResult.Rejected("JavaHost is shutting down.")
-                if (session != null) return StartResult.Rejected("A server is already running. Stop it before starting another one.")
-                return runCatching { startInternal(instanceId) }
-                    .getOrElse { error ->
-                        StartResult.Rejected(
-                            "Could not start the server: ${error.message ?: error.javaClass.simpleName}"
-                        )
-                    }
+        synchronized(lock) {
+            if (disposed) return StartResult.Rejected("JavaHost is shutting down.")
+            if (sessions.size >= ServerController.MAX_RUNNING_SERVERS) {
+                return StartResult.Rejected(
+                    "JavaHost can run at most ${ServerController.MAX_RUNNING_SERVERS} servers at the " +
+                        "same time. Stop one before starting another."
+                )
             }
-        } finally {
-            lifecycleMutex.unlock()
+            val existing = sessions[instanceId]
+            if (existing != null) {
+                val name = existing.instanceName
+                return StartResult.Rejected(
+                    if (existing.stopInitiated.get()) {
+                        "$name is still stopping. Try again in a moment."
+                    } else {
+                        "$name is already running. Stop it before starting it again."
+                    }
+                )
+            }
+            return runCatching { startInternal(instanceId) }
+                .getOrElse { error ->
+                    StartResult.Rejected(
+                        "Could not start the server: ${error.message ?: error.javaClass.simpleName}"
+                    )
+                }
         }
     }
 
     /**
-     * Resolve + spawn.  Caller must hold [lifecycleMutex] and [lock].
-     * All validation happens before any resource is created.
+     * Resolve + spawn one session. Caller must hold [lock]; all validation
+     * happens before any resource is created.
      */
     private fun startInternal(instanceId: String): StartResult {
         val instance = instances.get(instanceId)
             ?: return StartResult.Rejected("Server instance not found. It may have been deleted.")
         val appSettings = settings.current()
-        // A previous session must never leave the Bedrock bridge bound.
-        runCatching { bedrockRelay?.stop() }
-        bedrockRelay = null
+
+        // 0. Port conflict: a start whose port is already used by another running
+        //    session or merely configured instance would just fail inside the
+        //    child JVM (or worse, bind 127.0.0.1 only). Reject with the owner name.
+        val configuredPort = resolveConfiguredPort(instance)
+        if (configuredPort != null) {
+            val owner = portOwnerLocked(configuredPort, exceptInstanceId = instanceId)
+            if (owner != null) {
+                return StartResult.Rejected(portConflictMessage(configuredPort, owner))
+            }
+        }
 
         // 1. Java runtime.
         val javaHome = jre.javaHome(instance.jreMajor)
@@ -327,14 +359,53 @@ class ServerManager(
             runCatching { EulaManager.accept(paths, instanceId) }
         }
 
+        // Clear this instance's old console history before the launch diagnostics.
+        prepareConsoleForStart(instanceId)
+
         // 3b. LAN bind address: a leftover loopback `server-ip` (or a server
         // record with a phone-only address) makes localhost work while every
         // other device gets "connection refused". Clear it before launch.
         normalizeMinecraftBindAddress(instance)
 
-        // 3c. Bedrock Edition bridge (Geyser): moves Geyser to UDP 19133 and
-        // injects the environment override before the JVM starts.
-        val bedrockPlan = prepareBedrockBridge(instance)
+        // 3c. Bedrock Edition: decide whether this session owns the single LAN
+        // bridge and which internal port its Geyser should use.
+        val geyser = detectGeyser(instance)
+        var currentOwnerId = bedrockOwnerId
+        if (currentOwnerId != null && !sessions.containsKey(currentOwnerId)) {
+            // The previous owner already finished; do not keep the bridge
+            // permanently claimed by a dead session.
+            bedrockOwnerId = null
+            currentOwnerId = null
+        }
+        val bridgeWanted = appSettings.bedrockLanDiscovery && geyser.detected
+        val bridgeEnabled = bridgeWanted && currentOwnerId == null
+        val busyOwnerName = if (bridgeWanted && !bridgeEnabled) {
+            currentOwnerId?.let { owner ->
+                sessions[owner]?.instanceName ?: instances.get(owner)?.name
+            } ?: "another server"
+        } else {
+            null
+        }
+        val nonOwnerPorts = if (bridgeWanted && !bridgeEnabled) pickBedrockNonOwnerPorts() else null
+        val geyserPort = when {
+            bridgeEnabled -> BEDROCK_GEYSER_PORT
+            nonOwnerPorts != null -> nonOwnerPorts.raknetPort
+            else -> BEDROCK_GEYSER_PORT
+        }
+        val webrtcPort = when {
+            bridgeEnabled -> BEDROCK_GEYSER_WEBRTC_PORT
+            nonOwnerPorts != null -> nonOwnerPorts.webrtcPort
+            else -> BEDROCK_GEYSER_WEBRTC_PORT
+        }
+        val bedrockPlan = prepareBedrockBridge(
+            instance = instance,
+            bridgeEnabled = bridgeEnabled,
+            geyserPort = geyserPort,
+            webrtcPort = webrtcPort,
+            geyserDetected = geyser.detected,
+            geyserConfig = geyser.config,
+            busyOwnerName = busyOwnerName
+        )
 
         // 4. Memory.
         val memoryMb = LaunchPlanBuilder.resolvedMemoryMb(
@@ -375,7 +446,7 @@ class ServerManager(
         runCatching { logTail.startSession() }
         emitJarTypeWarning(instance, canonicalJar)
         emitMinecraftLoadDiagnostics(instance)
-        emitLanOverview(instance)
+        emitLanOverview(instance, bedrockPlan, busyOwnerName)
 
         val startedAt = System.currentTimeMillis()
         val process: Process = try {
@@ -383,7 +454,9 @@ class ServerManager(
             builder.directory(plan.workingDir)
             builder.redirectErrorStream(true)
             builder.environment().putAll(plan.environment)
-            if (bedrockPlan.requested) builder.environment().putAll(bedrockPlan.environment)
+            if (bedrockPlan.environment.isNotEmpty()) {
+                builder.environment().putAll(bedrockPlan.environment)
+            }
             builder.start()
         } catch (t: Throwable) {
             runCatching { logTail.close() }
@@ -391,6 +464,12 @@ class ServerManager(
                 "Could not start the Java process: ${t.message ?: t.javaClass.simpleName}. " +
                     "Check that the Java runtime is intact."
             )
+        }
+
+        // Ownership of the single Bedrock bridge is claimed only after the JVM
+        // actually spawned, so a failed launch never blocks the bridge.
+        if (bedrockPlan.requested) {
+            bedrockOwnerId = instanceId
         }
 
         // 8. Publish state before starting the reader so early console lines
@@ -405,20 +484,12 @@ class ServerManager(
             logTail = logTail,
             pid = ChildPidResolver.resolve(process)
         )
-        session = activeSession
         activeSession.serverPort = instance.serverPort
+        activeSession.resolvedPort = configuredPort
         activeSession.bedrockPlan = bedrockPlan
-        activeSession.bedrockStatus = BedrockLanStatus(
-            geyserDetected = bedrockPlan.geyserDetected,
-            bridgeRequested = bedrockPlan.requested,
-            relayPort = if (bedrockPlan.requested) BEDROCK_RELAY_PORT else null
-        )
-        consoleLimit = appSettings.consoleLogLimit.coerceIn(MIN_CONSOLE_LIMIT, MAX_CONSOLE_LIMIT)
-        synchronized(consoleLock) {
-            while (consoleBuffer.size > consoleLimit) consoleBuffer.removeFirst()
-        }
-        _activeInstanceId.value = instanceId
-        lastCrash = null
+        activeSession.bedrockStatus = initialBedrockStatus(bedrockPlan, busyOwnerName)
+        sessions[instanceId] = activeSession
+        _focusedId.value = instanceId
         runCatching { settings.update { it.copy(lastActiveInstanceId = instanceId) } }
         runCatching {
             instances.update(instanceId) {
@@ -426,27 +497,39 @@ class ServerManager(
             }
         }
         val (availMb, totalMb) = deviceMemoryMb()
-        _runtime.value = ServerRuntimeStatus(
-            state = RunState.STARTING,
-            instanceId = instanceId,
-            instanceName = instance.name,
-            pid = activeSession.pid,
-            startedAt = startedAt,
-            uptimeMs = 0L,
-            playersOnline = 0,
-            playersMax = 0,
-            heapUsedMb = null,
-            heapMaxMb = memoryMb,
-            processRssMb = null,
-            deviceAvailMb = availMb,
-            deviceTotalMb = totalMb,
-            ready = false,
-            lastExit = null
+        setRuntime(
+            ServerRuntimeStatus(
+                state = RunState.STARTING,
+                instanceId = instanceId,
+                instanceName = instance.name,
+                pid = activeSession.pid,
+                startedAt = startedAt,
+                uptimeMs = 0L,
+                playersOnline = 0,
+                playersMax = 0,
+                heapUsedMb = null,
+                heapMaxMb = memoryMb,
+                processRssMb = null,
+                deviceAvailMb = availMb,
+                deviceTotalMb = totalMb,
+                ready = false,
+                lastExit = null
+            )
         )
+        publishFocusedConsole()
         emitConsole(
+            instanceId,
             LogLevel.INFO,
             "Starting ${instance.name} (Java ${instance.jreMajor}, ${memoryMb} MB heap)"
         )
+        if (busyOwnerName != null && bedrockPlan.geyserDetected && !bedrockPlan.requested) {
+            emitConsole(
+                instanceId,
+                LogLevel.WARN,
+                "Bedrock LAN bridge is in use by $busyOwnerName; this server's Geyser uses UDP " +
+                    "${bedrockPlan.geyserInternalPort} — add it manually in Bedrock for that server."
+            )
+        }
 
         activeSession.readerJob = scope.launch { readerLoop(activeSession) }
         activeSession.waitJob = scope.launch { waitLoop(activeSession) }
@@ -458,12 +541,12 @@ class ServerManager(
     }
 
     // =====================================================================
-    // Contract: stop / restart / commands
+    // Contract: stop / restart / focus / commands
     // =====================================================================
 
-    override fun stop(force: Boolean) {
+    override fun stop(instanceId: String, force: Boolean) {
         val target: Session = synchronized(lock) {
-            val current = session ?: return
+            val current = sessions[instanceId] ?: return
             if (current.stopInitiated.get()) {
                 current.forceRequested = current.forceRequested || force
                 return
@@ -476,94 +559,138 @@ class ServerManager(
         }
         publishStopping(target)
         // Async on purpose: notification actions must return immediately and
-        // the Activity may be gone; the process shutdown continues in service.
-        scope.launch {
-            lifecycleMutex.withLock { stopSession(target, force) }
-        }
+        // the Activity may be gone; each session stops independently.
+        scope.launch { stopSession(target, force) }
     }
 
-    override fun restart() {
+    override fun restart(instanceId: String) {
         ensureOperational()
         synchronized(lock) {
-            if (restartJob?.isActive == true) return
-            val current = session ?: return // contract: no-op when nothing is active
-            val instanceId = current.instanceId
-            restartJob = scope.launch { performRestart(instanceId) }
+            if (restartJobs[instanceId]?.isActive == true) return
+            if (!sessions.containsKey(instanceId)) return // contract: no-op when nothing is active
+            val job = scope.launch { performRestart(instanceId) }
+            restartJobs[instanceId] = job
+            job.invokeOnCompletion {
+                synchronized(lock) {
+                    if (restartJobs[instanceId] === job) restartJobs.remove(instanceId)
+                }
+            }
         }
     }
 
     private suspend fun performRestart(instanceId: String) {
-        lifecycleMutex.withLock {
-            try {
-                ensureOperational()
-                val current = synchronized(lock) { session }
-                if (current != null && current.instanceId == instanceId) {
-                    synchronized(lock) {
-                        if (!current.stopping) current.stopping = true
-                        current.stopRequested = true
-                    }
-                    publishStopping(current)
-                    stopSession(current, force = false)
+        try {
+            ensureOperational()
+            val current = synchronized(lock) { sessions[instanceId] }
+            if (current != null) {
+                synchronized(lock) {
+                    if (!current.stopping) current.stopping = true
+                    current.stopRequested = true
                 }
-                val result = synchronized(lock) {
-                    when {
-                        disposed -> StartResult.Rejected("JavaHost is shutting down.")
-                        session != null -> StartResult.Rejected("The previous server is still shutting down.")
-                        else -> startInternal(instanceId)
-                    }
+                publishStopping(current)
+                stopSession(current, force = false)
+                withTimeoutOrNull(GRACEFUL_STOP_MAX_MS + 30_000L) { current.finished.await() }
+            }
+            val result = synchronized(lock) {
+                when {
+                    disposed -> StartResult.Rejected("JavaHost is shutting down.")
+                    sessions.containsKey(instanceId) ->
+                        StartResult.Rejected("The previous server is still shutting down.")
+                    sessions.size >= ServerController.MAX_RUNNING_SERVERS ->
+                        StartResult.Rejected(
+                            "JavaHost can run at most ${ServerController.MAX_RUNNING_SERVERS} " +
+                                "servers at the same time. Stop one before restarting this one."
+                        )
+                    else -> runCatching { startInternal(instanceId) }
+                        .getOrElse { error ->
+                            StartResult.Rejected(
+                                "Could not start the server: ${error.message ?: error.javaClass.simpleName}"
+                            )
+                        }
                 }
-                if (result is StartResult.Rejected) {
-                    emitConsole(LogLevel.ERROR, "Restart failed: ${result.message}")
-                    resetStoppingState(instanceId)
-                }
-            } catch (c: CancellationException) {
-                throw c
-            } catch (t: Throwable) {
-                emitConsole(
-                    LogLevel.ERROR,
-                    "Restart failed: ${t.message ?: t.javaClass.simpleName}"
-                )
+            }
+            if (result is StartResult.Rejected) {
+                emitConsole(instanceId, LogLevel.ERROR, "Restart failed: ${result.message}")
                 resetStoppingState(instanceId)
             }
+        } catch (c: CancellationException) {
+            throw c
+        } catch (t: Throwable) {
+            emitConsole(
+                instanceId,
+                LogLevel.ERROR,
+                "Restart failed: ${t.message ?: t.javaClass.simpleName}"
+            )
+            resetStoppingState(instanceId)
         }
     }
 
     private fun resetStoppingState(instanceId: String) {
-        _runtime.update { status ->
-            if (status.instanceId == instanceId && status.state == RunState.STOPPING) {
-                status.copy(state = RunState.STOPPED)
-            } else {
-                status
-            }
+        updateRuntime(instanceId) { status ->
+            if (status.state == RunState.STOPPING) status.copy(state = RunState.STOPPED) else status
         }
     }
 
-    override fun sendCommand(command: String) {
+    override fun focus(instanceId: String) {
+        val existing = synchronized(lock) { _runtimes.value[instanceId] }
+        val status = existing ?: run {
+            val instance = instances.get(instanceId)
+            val (availMb, totalMb) = deviceMemoryMb()
+            ServerRuntimeStatus(
+                state = RunState.STOPPED,
+                instanceId = instanceId,
+                instanceName = instance?.name,
+                deviceAvailMb = availMb,
+                deviceTotalMb = totalMb
+            )
+        }
+        synchronized(lock) {
+            _focusedId.value = instanceId
+            if (existing == null) {
+                _runtimes.value = _runtimes.value.toMutableMap().apply { put(instanceId, status) }
+            }
+            _runtime.value = status
+        }
+        publishFocusedConsole()
+    }
+
+    override fun sendCommand(instanceId: String, command: String) {
         val line = command.trim()
         if (line.isEmpty()) return
-        val current = synchronized(lock) { session } ?: return
+        val current = synchronized(lock) { sessions[instanceId] ?: return }
         if (!isProcessAlive(current.process)) {
-            emitConsole(LogLevel.WARN, "The server is no longer running; command ignored.")
+            emitConsole(
+                instanceId,
+                LogLevel.WARN,
+                "The server is no longer running; command ignored."
+            )
             return
         }
         if (writeStdin(current, line)) {
-            emitConsole(LogLevel.COMMAND, line)
+            emitConsole(instanceId, LogLevel.COMMAND, line)
         } else {
-            emitConsole(LogLevel.WARN, "Could not send the command to the server process.")
+            emitConsole(
+                instanceId,
+                LogLevel.WARN,
+                "Could not send the command to the server process."
+            )
         }
     }
 
-    override fun clearConsole() {
+    override fun clearConsole(instanceId: String) {
         synchronized(consoleLock) {
-            consoleBuffer.clear()
-            consoleDirty.set(false)
+            consoleBuffers[instanceId]?.clear()
         }
-        _consoleEntries.value = emptyList()
+        if (_focusedId.value == instanceId) {
+            consoleDirty.set(false)
+            _consoleEntries.value = emptyList()
+        }
     }
 
-    override fun exportConsole(destination: File): Result<File> = runCatching {
-        publishConsoleIfDirty()
-        val entries = _consoleEntries.value
+    override fun exportConsole(instanceId: String, destination: File): Result<File> = runCatching {
+        val entries = synchronized(consoleLock) {
+            consoleBuffers[instanceId]?.toList() ?: emptyList()
+        }
         destination.parentFile?.mkdirs()
         destination.bufferedWriter(Charsets.UTF_8).use { writer ->
             for (entry in entries) {
@@ -574,51 +701,88 @@ class ServerManager(
         destination
     }
 
-    override fun recentTail(count: Int): List<String> {
+    override fun recentTail(instanceId: String, count: Int): List<String> {
         if (count <= 0) return emptyList()
-        val current = synchronized(lock) { session }
+        val current = synchronized(lock) { sessions[instanceId] }
         if (current != null) return current.tailSnapshot(count)
-        lastCrash?.takeIf { it.tail.isNotEmpty() }?.let { crash -> return crash.tail.takeLast(count) }
-        val id = _activeInstanceId.value ?: return emptyList()
-        for (file in diskTailCandidates(id)) {
+        val crash = synchronized(lock) { _runtimes.value[instanceId]?.lastExit }
+        crash?.takeIf { it.tail.isNotEmpty() }?.let { return it.tail.takeLast(count) }
+        for (file in diskTailCandidates(instanceId)) {
             val lines = LogTailStore.tailOf(file, count)
             if (lines.isNotEmpty()) return lines
         }
         return emptyList()
     }
 
-    override fun activeLastCrash(): ExitInfo? = lastCrash
+    override fun activeLastCrash(instanceId: String): ExitInfo? =
+        synchronized(lock) { _runtimes.value[instanceId]?.lastExit }
 
-    override fun probeLan(): Boolean {
-        val current = synchronized(lock) { session } ?: return false
+    override fun clearLastCrash(instanceId: String) {
+        updateRuntime(instanceId) { status ->
+            if (status.state == RunState.CRASHED) {
+                status.copy(state = RunState.STOPPED, lastExit = null)
+            } else {
+                status.copy(lastExit = null)
+            }
+        }
+        runCatching {
+            instances.update(instanceId) { it.copy(lastCrashSummary = null) }
+        }
+    }
+
+    override fun probeLan(instanceId: String): Boolean {
+        val current = synchronized(lock) { sessions[instanceId] } ?: return false
         if (!current.ready) {
             emitConsole(
+                instanceId,
                 LogLevel.INFO,
                 "The server is still starting; the LAN self-test runs automatically once it is ready."
             )
         }
-        if (!lanProbeInFlight.compareAndSet(false, true)) return true
+        if (!probeInFlight.add(instanceId)) return true
         scope.launch {
             try {
                 runCatching { refreshLan(current, probe = true, forceReport = true) }
                 if (current.bedrockRelayStarted) runCatching { refreshBedrock(current) }
             } finally {
-                lanProbeInFlight.set(false)
+                probeInFlight.remove(instanceId)
             }
         }
         return true
     }
 
-    override fun forceStop(): Boolean {
-        restartJob?.cancel()
-        restartJob = null
-        val current = synchronized(lock) {
-            session.also { session = null }
-        }
-        if (current == null) {
-            resetRuntimeAfterForcedStop(null)
+    override fun hasActiveSession(instanceId: String): Boolean =
+        synchronized(lock) { sessions.containsKey(instanceId) }
+
+    override fun hasAnyActiveSession(): Boolean =
+        synchronized(lock) { sessions.isNotEmpty() }
+
+    override fun forceStop(instanceId: String): Boolean {
+        val current: Session = synchronized(lock) {
+            restartJobs.remove(instanceId)?.cancel()
+            sessions.remove(instanceId)
+        } ?: run {
+            resetRuntimeAfterForcedStop(instanceId)
             return false
         }
+        clearSessionNow(current)
+        return true
+    }
+
+    override fun forceStopAll(): Int {
+        val snapshot: List<Session> = synchronized(lock) {
+            for (job in restartJobs.values) job.cancel()
+            restartJobs.clear()
+            val all = sessions.values.toList()
+            sessions.clear()
+            all
+        }
+        for (session in snapshot) clearSessionNow(session)
+        return snapshot.size
+    }
+
+    /** Kills a (possibly wedged) session, finalizes it and publishes its terminal state. */
+    private fun clearSessionNow(current: Session) {
         current.stopRequested = true
         current.forceRequested = true
         current.stopInitiated.set(true)
@@ -630,13 +794,20 @@ class ServerManager(
         runCatching { current.exitDeferred.complete(code) }
         runCatching { finishSession(current, code) }
         resetRuntimeAfterForcedStop(current.instanceId)
-        emitConsole(LogLevel.WARN, "Server session was force-cleared after a stuck stop.")
-        return true
+        emitConsole(
+            current.instanceId,
+            LogLevel.WARN,
+            "Server session was force-cleared after a stuck stop."
+        )
     }
 
     private fun resetRuntimeAfterForcedStop(instanceId: String?) {
-        _runtime.update { status ->
-            if (status.isActive || (instanceId != null && status.instanceId == instanceId)) {
+        val id = instanceId ?: _focusedId.value ?: return
+        // A replacement session for the same instance may already be starting;
+        // never clobber its runtime entry with a forced-stop reset.
+        if (synchronized(lock) { sessions.containsKey(id) }) return
+        updateRuntime(id) { status ->
+            if (status.isActive) {
                 status.copy(
                     state = RunState.STOPPED,
                     pid = null,
@@ -652,7 +823,7 @@ class ServerManager(
 
     override fun shutdown() {
         if (!shutdownOnce.compareAndSet(false, true)) return
-        val current: Session?
+        val active: List<Session>
         val oldScope: CoroutineScope
         val oldPublisher: Job?
         synchronized(lock) {
@@ -662,15 +833,13 @@ class ServerManager(
             disposed = true
             oldScope = scope
             oldPublisher = consolePublisherJob
-            current = session
-            session = null
+            active = sessions.values.toList()
+            sessions.clear()
+            for (job in restartJobs.values) job.cancel()
+            restartJobs.clear()
+            bedrockOwnerId = null
         }
-        if (current == null) {
-            // A stale "active" runtime without a session is a ghost snapshot: clear
-            // it so the UI does not keep showing a running card after teardown.
-            resetRuntimeAfterForcedStop(null)
-        }
-        if (current != null) {
+        for (current in active) {
             current.stopRequested = true
             current.forceRequested = true
             stopLanAnnouncement(current)
@@ -682,18 +851,43 @@ class ServerManager(
             runCatching { if (current.process.isAlive) current.process.destroyForcibly() }
             current.statsJob?.cancel()
             current.readerJob?.cancel()
+            current.waitJob?.cancel()
             runCatching { current.logTail.close() }
             current.exitDeferred.complete(-1)
             current.finished.complete(Unit)
+            val previous = synchronized(lock) { _runtimes.value[current.instanceId] }
             val (availMb, totalMb) = deviceMemoryMb()
-            _runtime.value = ServerRuntimeStatus(
-                state = RunState.STOPPED,
-                instanceId = current.instanceId,
-                instanceName = current.instanceName,
-                deviceAvailMb = availMb,
-                deviceTotalMb = totalMb,
-                lastExit = _runtime.value.lastExit
+            setRuntime(
+                ServerRuntimeStatus(
+                    state = RunState.STOPPED,
+                    instanceId = current.instanceId,
+                    instanceName = current.instanceName,
+                    deviceAvailMb = availMb,
+                    deviceTotalMb = totalMb,
+                    lastExit = previous?.lastExit
+                )
             )
+        }
+        // Any stale "active" runtime without a session is a ghost snapshot: clear
+        // it so the UI does not keep showing a running card after teardown.
+        synchronized(lock) {
+            val cleaned = _runtimes.value.mapValues { (_, status) ->
+                if (status.isActive) {
+                    status.copy(
+                        state = RunState.STOPPED,
+                        pid = null,
+                        startedAt = null,
+                        uptimeMs = 0L,
+                        ready = false
+                    )
+                } else {
+                    status
+                }
+            }
+            if (cleaned != _runtimes.value) {
+                _runtimes.value = cleaned
+                _runtime.value = cleaned[_focusedId.value] ?: _runtime.value
+            }
         }
         oldPublisher?.cancel()
         if (consolePublisherJob === oldPublisher) consolePublisherJob = null
@@ -720,16 +914,6 @@ class ServerManager(
 
     fun isEulaAccepted(instanceId: String): Boolean = EulaManager.isAccepted(paths, instanceId)
 
-    /** Clears the "last crash" banner once the user acknowledged it. */
-    override fun clearLastCrash() {
-        lastCrash = null
-        _runtime.update { if (it.state == RunState.CRASHED) it.copy(lastExit = null) else it }
-        val id = _activeInstanceId.value ?: return
-        runCatching {
-            instances.update(id) { it.copy(lastCrashSummary = null) }
-        }
-    }
-
     /**
      * Tail of the log for any instance, used by the UI after a restart/crash.
      * Prefers the in-memory tail of the active session, then the last crash
@@ -739,14 +923,10 @@ class ServerManager(
      */
     override fun readStartupTail(instanceId: String, lines: Int): List<String> {
         if (lines <= 0) return emptyList()
-        val current = synchronized(lock) { session }
-        if (current != null && current.instanceId == instanceId) {
-            return current.tailSnapshot(lines)
-        }
-        val crash = lastCrash
-        if (crash != null && _activeInstanceId.value == instanceId && crash.tail.isNotEmpty()) {
-            return crash.tail.takeLast(lines)
-        }
+        val current = synchronized(lock) { sessions[instanceId] }
+        if (current != null) return current.tailSnapshot(lines)
+        val crash = synchronized(lock) { _runtimes.value[instanceId]?.lastExit }
+        if (crash != null && crash.tail.isNotEmpty()) return crash.tail.takeLast(lines)
         for (file in diskTailCandidates(instanceId)) {
             val tail = LogTailStore.tailOf(file, lines)
             if (tail.isNotEmpty()) return tail
@@ -766,11 +946,53 @@ class ServerManager(
     )
 
     // =====================================================================
-    // Console engine
+    // Runtime publishing
     // =====================================================================
 
-    private fun emitConsole(level: LogLevel, text: String) {
+    /** Applies [transform] to one instance's runtime and mirrors it when focused. */
+    private fun updateRuntime(
+        instanceId: String,
+        transform: (ServerRuntimeStatus) -> ServerRuntimeStatus
+    ) {
+        synchronized(lock) {
+            val current = _runtimes.value[instanceId]
+                ?: ServerRuntimeStatus(
+                    instanceId = instanceId,
+                    instanceName = instances.get(instanceId)?.name
+                )
+            val next = transform(current)
+            _runtimes.value = _runtimes.value.toMutableMap().apply { put(instanceId, next) }
+            if (_focusedId.value == instanceId) _runtime.value = next
+        }
+    }
+
+    /** Replaces one instance's full runtime status and mirrors it when focused. */
+    private fun setRuntime(status: ServerRuntimeStatus) {
+        val id = status.instanceId
+        synchronized(lock) {
+            if (id != null) {
+                _runtimes.value = _runtimes.value.toMutableMap().apply { put(id, status) }
+            }
+            if (id == null || _focusedId.value == id) _runtime.value = status
+        }
+    }
+
+    private fun isCurrentSession(session: Session): Boolean =
+        synchronized(lock) { sessions[session.instanceId] === session }
+
+    // =====================================================================
+    // Console engine (one buffer per instance, only the focused one published)
+    // =====================================================================
+
+    /**
+     * Appends one line to [instanceId]'s console buffer. When that instance is
+     * focused the live stream and the published snapshot follow immediately;
+     * otherwise the line waits in the buffer until the user focuses it.
+     */
+    private fun emitConsole(instanceId: String, level: LogLevel, text: String) {
         if (text.isEmpty()) return
+        val id = instanceId.ifBlank { _focusedId.value ?: "" }
+        if (id.isEmpty()) return
         val entry = ConsoleEntry(
             seq = seq.incrementAndGet(),
             timestamp = System.currentTimeMillis(),
@@ -778,19 +1000,50 @@ class ServerManager(
             text = text
         )
         synchronized(consoleLock) {
-            consoleBuffer.addLast(entry)
-            while (consoleBuffer.size > consoleLimit) consoleBuffer.removeFirst()
+            val buffer = consoleBuffers.getOrPut(id) { ArrayDeque() }
+            buffer.addLast(entry)
+            while (buffer.size > consoleLimit) buffer.removeFirst()
+            if (_focusedId.value == id) {
+                consoleDirty.set(true)
+                _consoleLive.tryEmit(entry)
+            }
         }
-        consoleDirty.set(true)
-        _consoleLive.tryEmit(entry)
     }
 
     private fun publishConsoleIfDirty() {
         if (!consoleDirty.get()) return
-        val snapshot: List<ConsoleEntry>? = synchronized(consoleLock) {
-            if (!consoleDirty.getAndSet(false)) null else consoleBuffer.toList()
+        val focusedId = _focusedId.value
+        val snapshot: List<ConsoleEntry> = synchronized(consoleLock) {
+            consoleDirty.set(false)
+            focusedId?.let { consoleBuffers[it]?.toList() } ?: emptyList()
         }
-        if (snapshot != null) _consoleEntries.value = snapshot
+        _consoleEntries.value = snapshot
+    }
+
+    /** Publishes the focused instance's console buffer immediately. */
+    private fun publishFocusedConsole() {
+        val focusedId = _focusedId.value
+        val snapshot: List<ConsoleEntry> = synchronized(consoleLock) {
+            consoleDirty.set(false)
+            focusedId?.let { consoleBuffers[it]?.toList() } ?: emptyList()
+        }
+        _consoleEntries.value = snapshot
+    }
+
+    /** Clears [instanceId]'s console buffer and applies the current limit to all buffers. */
+    private fun prepareConsoleForStart(instanceId: String) {
+        val limit = settings.current().consoleLogLimit.coerceIn(MIN_CONSOLE_LIMIT, MAX_CONSOLE_LIMIT)
+        consoleLimit = limit
+        synchronized(consoleLock) {
+            consoleBuffers[instanceId] = ArrayDeque()
+            for (buffer in consoleBuffers.values) {
+                while (buffer.size > limit) buffer.removeFirst()
+            }
+        }
+        if (_focusedId.value == instanceId) {
+            consoleDirty.set(false)
+            _consoleEntries.value = emptyList()
+        }
     }
 
     private fun handleLine(session: Session, rawLine: String) {
@@ -821,8 +1074,9 @@ class ServerManager(
             publishSessionProgress(session)
         }
         ConsoleParser.parsePort(stripped)?.let { port ->
-            if (session.serverPort != port) {
+            if (session.serverPort != port || session.resolvedPort != port) {
                 session.serverPort = port
+                session.resolvedPort = port
                 runCatching {
                     instances.update(session.instanceId) {
                         if (it.serverPort == port) it else it.copy(serverPort = port)
@@ -833,6 +1087,7 @@ class ServerManager(
         if (!session.eulaPromptSeen && ConsoleParser.isEulaPrompt(stripped)) {
             session.eulaPromptSeen = true
             emitConsole(
+                session.instanceId,
                 LogLevel.WARN,
                 "The server is asking for the Minecraft EULA. Accept it in the server settings to start the server."
             )
@@ -841,7 +1096,7 @@ class ServerManager(
             session.observedSignal = signal
         }
         emitPluginCompatibilityHints(session, stripped)
-        emitConsole(ConsoleParser.classify(stripped), display)
+        emitConsole(session.instanceId, ConsoleParser.classify(stripped), display)
     }
 
     /**
@@ -857,6 +1112,7 @@ class ServerManager(
         ) {
             session.viaVersionHintEmitted = true
             emitConsole(
+                session.instanceId,
                 LogLevel.WARN,
                 "ViaVersion cannot add protocol support for this server version. " +
                     "If your Java client is OLDER than the server, install ViaBackwards " +
@@ -870,17 +1126,19 @@ class ServerManager(
         ) {
             session.geyserNativeHintEmitted = true
             emitConsole(
+                session.instanceId,
                 LogLevel.WARN,
                 "Geyser's NetherNet/WebRTC transport cannot load its native library on Android/bionic. " +
                     "This is a plugin-native limitation, not a JavaHost bug: Bedrock clients may still " +
-                    "connect over Geyser's RakNet/UDP 19132 path depending on their version; Java clients " +
-                    "should use the Java port (25565) instead."
+                    "connect over Geyser's RakNet/UDP path depending on their version; Java clients " +
+                    "should use the Java port instead."
             )
         }
     }
 
     private fun markReady(session: Session) {
         if (session.ready || session.finalized.get()) return
+        if (!isCurrentSession(session)) return
         session.ready = true
         // The server is actually listening now: start the Minecraft LAN
         // discovery announcement and run the reachability self-test.
@@ -889,8 +1147,8 @@ class ServerManager(
             delay(LAN_READY_SETTLE_MS)
             runCatching { refreshLan(session, probe = true, forceReport = true) }
         }
-        _runtime.update { status ->
-            if (status.instanceId != session.instanceId || !isActiveState(status.state)) return@update status
+        updateRuntime(session.instanceId) { status ->
+            if (!isActiveState(status.state)) return@updateRuntime status
             status.copy(
                 state = RunState.RUNNING,
                 ready = true,
@@ -902,8 +1160,9 @@ class ServerManager(
     }
 
     private fun publishSessionProgress(session: Session) {
-        _runtime.update { status ->
-            if (status.instanceId != session.instanceId || !isActiveState(status.state)) return@update status
+        if (!isCurrentSession(session)) return
+        updateRuntime(session.instanceId) { status ->
+            if (!isActiveState(status.state)) return@updateRuntime status
             status.copy(
                 playersOnline = session.playersOnline,
                 playersMax = session.playersMax,
@@ -914,8 +1173,8 @@ class ServerManager(
     }
 
     private fun publishStopping(session: Session) {
-        _runtime.update { status ->
-            if (status.instanceId != session.instanceId || !isActiveState(status.state)) return@update status
+        updateRuntime(session.instanceId) { status ->
+            if (!isActiveState(status.state)) return@updateRuntime status
             status.copy(
                 state = RunState.STOPPING,
                 uptimeMs = (System.currentTimeMillis() - session.startedAt).coerceAtLeast(0L)
@@ -939,6 +1198,7 @@ class ServerManager(
         } catch (t: Throwable) {
             if (isProcessAlive(session.process)) {
                 emitConsole(
+                    session.instanceId,
                     LogLevel.DEBUG,
                     "Console reader stopped: ${t.message ?: t.javaClass.simpleName}"
                 )
@@ -966,6 +1226,7 @@ class ServerManager(
         var lastHeapAt = System.currentTimeMillis()
         while (currentCoroutineContext().isActive) {
             if (session.exitDeferred.isCompleted) break
+            if (!isCurrentSession(session)) break
             val now = System.currentTimeMillis()
             var pid = session.pid
             if (pid == null) {
@@ -986,10 +1247,8 @@ class ServerManager(
             } else {
                 session.serverPort?.let { runCatching { PortConnectionCounter.count(it) }.getOrNull() }
             }
-            _runtime.update { status ->
-                if (status.instanceId != session.instanceId || !isActiveState(status.state)) {
-                    return@update status
-                }
+            updateRuntime(session.instanceId) { status ->
+                if (!isActiveState(status.state)) return@updateRuntime status
                 var state = status.state
                 if (state == RunState.STARTING &&
                     (session.ready || now - session.startedAt >= STARTING_FALLBACK_RUNNING_MS)
@@ -1017,45 +1276,40 @@ class ServerManager(
                 runCatching { reconcileLanAnnouncement(session) }
             }
             if (session.isMinecraft && session.bedrockPlan.requested) {
-                val started = session.bedrockRelayStarted
-                if (!started &&
-                    (session.ready || now - session.startedAt >= STARTING_FALLBACK_RUNNING_MS) &&
-                    now - session.bedrockLastAttemptAt >= BEDROCK_START_RETRY_MS
-                ) {
-                    session.bedrockLastAttemptAt = now
-                    runCatching { startBedrockBridge(session) }
-                } else if (started && now - session.bedrockLastRefreshAt >= BEDROCK_STATUS_INTERVAL_MS) {
-                    session.bedrockLastRefreshAt = now
-                    runCatching { refreshBedrock(session) }
+                val ownsBridge = synchronized(lock) { bedrockOwnerId == session.instanceId }
+                if (ownsBridge) {
+                    val started = session.bedrockRelayStarted
+                    if (!started &&
+                        (session.ready || now - session.startedAt >= STARTING_FALLBACK_RUNNING_MS) &&
+                        now - session.bedrockLastAttemptAt >= BEDROCK_START_RETRY_MS
+                    ) {
+                        session.bedrockLastAttemptAt = now
+                        runCatching { startBedrockBridge(session) }
+                    } else if (started &&
+                        now - session.bedrockLastRefreshAt >= BEDROCK_STATUS_INTERVAL_MS
+                    ) {
+                        session.bedrockLastRefreshAt = now
+                        runCatching { refreshBedrock(session) }
+                    }
                 }
             }
             delay(STATS_INTERVAL_MS)
         }
     }
 
-    // =====================================================================
-    // Graceful stop
-    // =====================================================================
-
-    /**
-     * Shared graceful/force shutdown for [stop] and [restart].
-     *
-     * Minecraft gets a "stop" command and up to 20 s; generic servers do not get
-     * a fake command (most would not understand it), they simply get a short
-     * 2 s grace before SIGTERM.  SIGTERM is followed by SIGKILL after 3 s.
-     * Requests are idempotent and a later `stop(force = true)` escalates.
-     */
     /**
      * Warns when the persisted flavor (possibly a manual override) disagrees
      * with what the JAR actually looks like. This prevents the classic
      * "plugins don't load" trap when a Vanilla JAR was mislabeled as Paper.
      */
     private fun emitJarTypeWarning(instance: ServerInstance, jarFile: File) {
+        val instanceId = instance.id
         if (!instance.isMinecraft) return
         val inspection = (runCatching { JarInspector.inspect(jarFile) }.getOrNull() as? InspectionResult.Success)
             ?.inspection ?: return
         if (inspection.kind != instance.kind) {
             emitConsole(
+                instanceId,
                 LogLevel.WARN,
                 "The imported JAR looks like ${inspection.label}, but this instance is set to " +
                     "${instance.kind.name.lowercase()}. Check the server type; plugins/mods may not load."
@@ -1067,6 +1321,7 @@ class ServerManager(
             instance.flavor != ServerFlavor.OTHER_MINECRAFT
         ) {
             emitConsole(
+                instanceId,
                 LogLevel.WARN,
                 "The imported JAR looks like ${inspection.label}, but this instance is set to " +
                     "${instance.flavor.name.lowercase().replace('_', ' ')}. " +
@@ -1082,6 +1337,7 @@ class ServerManager(
      */
     private fun emitMinecraftLoadDiagnostics(instance: ServerInstance) {
         if (!instance.isMinecraft) return
+        val instanceId = instance.id
         val plugins = paths.pluginsDir(instance.id)
             .listFiles { file -> file.isFile && file.extension.equals("jar", ignoreCase = true) }
             .orEmpty()
@@ -1089,6 +1345,7 @@ class ServerManager(
             .listFiles { file -> file.isFile && file.extension.equals("jar", ignoreCase = true) }
             .orEmpty()
         emitConsole(
+            instanceId,
             LogLevel.INFO,
             "Server type: ${instance.flavor.name.lowercase().replace('_', ' ')} · " +
                 "Minecraft ${instance.minecraftVersion ?: "version unknown"} · " +
@@ -1098,6 +1355,7 @@ class ServerManager(
             ServerFlavor.VANILLA -> {
                 if (plugins.isNotEmpty() || mods.isNotEmpty()) {
                     emitConsole(
+                        instanceId,
                         LogLevel.WARN,
                         "This is a Vanilla server: it does NOT load plugins or mods. " +
                             "Geyser, Floodgate and ViaVersion need a Paper/Spigot server jar " +
@@ -1107,9 +1365,14 @@ class ServerManager(
             }
             ServerFlavor.PAPER, ServerFlavor.BUKKIT, ServerFlavor.OTHER_MINECRAFT -> {
                 if (plugins.isEmpty()) {
-                    emitConsole(LogLevel.WARN, "No plugin JARs found in plugins/ — plugins installed in the app appear there and load on the next start.")
+                    emitConsole(
+                        instanceId,
+                        LogLevel.WARN,
+                        "No plugin JARs found in plugins/ — plugins installed in the app appear there and load on the next start."
+                    )
                 } else {
                     emitConsole(
+                        instanceId,
                         LogLevel.INFO,
                         "Bukkit-family server: ${plugins.size} plugin JAR(s) will be loaded from plugins/: " +
                             plugins.take(12).joinToString { it.name }
@@ -1121,6 +1384,7 @@ class ServerManager(
                     val hasViaBackwards = names.any { "viabackwards" in it }
                     if (hasGeyser && !hasFloodgate) {
                         emitConsole(
+                            instanceId,
                             LogLevel.WARN,
                             "Geyser is installed but Floodgate is not. Bedrock authentication may fail. " +
                                 "Floodgate for Paper is distributed by GeyserMC (geysermc.org), not Modrinth; " +
@@ -1129,6 +1393,7 @@ class ServerManager(
                     }
                     if (hasViaVersion && !hasViaBackwards) {
                         emitConsole(
+                            instanceId,
                             LogLevel.INFO,
                             "ViaVersion lets NEWER clients join; for OLDER clients also install ViaBackwards " +
                                 "(and ViaRewind for 1.7/1.8) unless every client matches the server version."
@@ -1136,15 +1401,27 @@ class ServerManager(
                     }
                 }
                 if (mods.isNotEmpty()) {
-                    emitConsole(LogLevel.WARN, "mods/ is not used by Paper/Spigot; use plugins/ for Bukkit plugins.")
+                    emitConsole(
+                        instanceId,
+                        LogLevel.WARN,
+                        "mods/ is not used by Paper/Spigot; use plugins/ for Bukkit plugins."
+                    )
                 }
             }
             ServerFlavor.FABRIC, ServerFlavor.FORGE -> {
                 if (mods.isEmpty()) {
-                    emitConsole(LogLevel.WARN, "No mod JARs found in mods/ — Fabric/Forge mods load from mods/, not plugins/.")
+                    emitConsole(
+                        instanceId,
+                        LogLevel.WARN,
+                        "No mod JARs found in mods/ — Fabric/Forge mods load from mods/, not plugins/."
+                    )
                 }
                 if (plugins.isNotEmpty()) {
-                    emitConsole(LogLevel.WARN, "plugins/ is ignored by Fabric/Forge; put mods in mods/ instead.")
+                    emitConsole(
+                        instanceId,
+                        LogLevel.WARN,
+                        "plugins/ is ignored by Fabric/Forge; put mods in mods/ instead."
+                    )
                 }
             }
             ServerFlavor.GENERIC -> Unit
@@ -1152,7 +1429,7 @@ class ServerManager(
     }
 
     // =====================================================================
-    // LAN access / Minecraft discovery
+    // LAN access / Minecraft discovery (per session)
     // =====================================================================
 
     /**
@@ -1163,12 +1440,18 @@ class ServerManager(
      * are used: cellular (`ccmni*`, `rmnet*`) and VPN (`tun*`) addresses are
      * not reachable from the user's LAN, which was the original bug.
      */
-    private fun emitLanOverview(instance: ServerInstance) {
+    private fun emitLanOverview(
+        instance: ServerInstance,
+        bedrockPlan: BedrockBridgePlan,
+        bridgeBusyOwner: String?
+    ) {
+        val instanceId = instance.id
         val endpoints = runCatching { lanInfo.endpoints() }.getOrDefault(emptyList())
         val network = runCatching { lanInfo.networkState() }.getOrNull()
         val port = resolveLanPort(instance, null)
         if (endpoints.isEmpty()) {
             emitConsole(
+                instanceId,
                 LogLevel.WARN,
                 "LAN access: no usable LAN address. ${buildNoLanWarning(network)}"
             )
@@ -1180,12 +1463,14 @@ class ServerManager(
                     port?.let { endpoint.httpUrl(it) } ?: endpoint.address
                 }
                 emitConsole(
+                    instanceId,
                     LogLevel.INFO,
                     "LAN address: $shown (${endpoint.label}, ${endpoint.interfaceName})"
                 )
             }
             if (endpoints.size > 1) {
                 emitConsole(
+                    instanceId,
                     LogLevel.INFO,
                     "Multiple LAN interfaces found. Use the address of the network your client " +
                         "device is connected to; all of them are listed in the server's LAN card."
@@ -1194,6 +1479,7 @@ class ServerManager(
         }
         if (network?.vpnActive == true) {
             emitConsole(
+                instanceId,
                 LogLevel.WARN,
                 "A VPN is active. VPNs often block incoming LAN connections; turn the VPN off " +
                     "while hosting and try again."
@@ -1202,6 +1488,7 @@ class ServerManager(
         if (!instance.isMinecraft) return
 
         emitConsole(
+            instanceId,
             LogLevel.INFO,
             "Minecraft dedicated servers do not appear in the LAN list by themselves. JavaHost " +
                 "announces this server over multicast once it is ready (Settings -> Minecraft LAN " +
@@ -1209,37 +1496,39 @@ class ServerManager(
         )
         if (port != null && endpoints.isNotEmpty()) {
             emitConsole(
+                instanceId,
                 LogLevel.INFO,
                 "Minecraft: add server ${endpoints.first().hostPort(port)} if it is not listed automatically."
             )
         }
 
-        val hasGeyser = runCatching {
-            paths.pluginsDir(instance.id).listFiles { f ->
-                f.isFile && f.extension.equals("jar", true) && f.name.contains("geyser", true)
-            }?.isNotEmpty() == true
-        }.getOrDefault(false) || runCatching {
-            paths.modsDir(instance.id).listFiles { f ->
-                f.isFile && f.extension.equals("jar", true) && f.name.contains("geyser", true)
-            }?.isNotEmpty() == true
-        }.getOrDefault(false)
         val firstAddress = endpoints.firstOrNull()?.address ?: "<phone-ip>"
-        val bedrockBridgeOn = settings.current().bedrockLanDiscovery
+        val bridgeFeatureOn = settings.current().bedrockLanDiscovery
         when {
-            hasGeyser && bedrockBridgeOn -> emitConsole(
+            bedrockPlan.requested -> emitConsole(
+                instanceId,
                 LogLevel.INFO,
                 "Bedrock Edition: JavaHost's Bedrock LAN bridge listens on UDP $BEDROCK_RELAY_PORT " +
-                    "(Geyser is moved to UDP $BEDROCK_GEYSER_PORT). Once the server is ready, Bedrock " +
-                    "clients on the same Wi-Fi/hotspot should see it in LAN/Friends. Manual fallback: " +
-                    "Add Server $firstAddress:$BEDROCK_RELAY_PORT."
+                    "(Geyser is moved to UDP ${bedrockPlan.geyserInternalPort}). Once the server is ready, " +
+                    "Bedrock clients on the same Wi-Fi/hotspot should see it in LAN/Friends. Manual " +
+                    "fallback: Add Server $firstAddress:$BEDROCK_RELAY_PORT."
             )
-            hasGeyser -> emitConsole(
+            bedrockPlan.geyserDetected && bridgeFeatureOn && bridgeBusyOwner != null -> emitConsole(
+                instanceId,
                 LogLevel.INFO,
-                "Bedrock Edition: the Bedrock LAN bridge is disabled in Settings. Geyser listens on " +
-                    "UDP 19132; Bedrock clients can add the server manually with " +
-                    "$firstAddress:19132 (LAN/Friends discovery may not list it)."
+                "Bedrock Edition: the LAN bridge is used by $bridgeBusyOwner. This server's Geyser " +
+                    "listens on UDP ${bedrockPlan.geyserInternalPort}; add " +
+                    "$firstAddress:${bedrockPlan.geyserInternalPort} manually in Bedrock for this server."
+            )
+            bedrockPlan.geyserDetected -> emitConsole(
+                instanceId,
+                LogLevel.INFO,
+                "Bedrock Edition: the Bedrock LAN bridge is disabled in Settings. Bedrock clients can " +
+                    "add the server manually with $firstAddress:${bedrockPlan.geyserInternalPort} " +
+                    "(LAN/Friends discovery may not list it)."
             )
             instance.flavor == ServerFlavor.PAPER || instance.flavor == ServerFlavor.BUKKIT -> emitConsole(
+                instanceId,
                 LogLevel.INFO,
                 "Bedrock Edition: install Geyser + Floodgate in plugins/ to let Bedrock clients join " +
                     "this Paper/Spigot server. JavaHost then bridges Bedrock LAN discovery on UDP " +
@@ -1249,12 +1538,13 @@ class ServerManager(
     }
 
     /**
-     * Recomputes [LanStatus] for the active session (addresses, port, phone
-     * connectivity, optional TCP self-test) and publishes it to the runtime so
-     * the UI's LAN card stays current. Never throws.
+     * Recomputes [LanStatus] for one session (addresses, port, phone
+     * connectivity, optional TCP self-test) and publishes it to that instance's
+     * runtime so the UI's LAN card stays current. Never throws.
      */
     private suspend fun refreshLan(session: Session, probe: Boolean, forceReport: Boolean = false) {
         if (session.finalized.get()) return
+        if (!isCurrentSession(session)) return
         val instance = instances.get(session.instanceId) ?: return
         val network = withContext(Dispatchers.IO) {
             runCatching { lanInfo.networkState() }.getOrNull()
@@ -1315,20 +1605,15 @@ class ServerManager(
             bedrock = currentBedrockStatus(session)
         )
         session.lanRefreshAt = System.currentTimeMillis()
-        val stillCurrent = synchronized(lock) { this.session } === session
-        if (!stillCurrent) return
-        _runtime.update { status ->
-            if (status.instanceId == session.instanceId && isActiveState(status.state)) {
-                status.copy(lan = lan)
-            } else {
-                status
-            }
+        if (!isCurrentSession(session)) return
+        updateRuntime(session.instanceId) { status ->
+            if (isActiveState(status.state)) status.copy(lan = lan) else status
         }
         if (forceReport || !session.lanReported) {
             session.lanReported = true
-            emitLanRefreshReport(lan)
+            emitLanRefreshReport(session.instanceId, lan)
         } else if (probes.isNotEmpty()) {
-            for (info in probes) emitProbeConsole(info)
+            for (info in probes) emitProbeConsole(session.instanceId, info)
         }
     }
 
@@ -1379,17 +1664,20 @@ class ServerManager(
     }
 
     /**
-     * Applies the live discovery setting and interface changes to the running
+     * Applies the live discovery setting and interface changes to one running
      * server: toggling "Minecraft LAN discovery announcement" takes effect
-     * immediately, and a Wi-Fi/hotspot change re-binds the announcer to the new
-     * interface (a datagram sent on the wrong interface advertises the wrong IP).
+     * immediately, and a Wi-Fi/hotspot change re-binds that server's announcer
+     * to the new interface (a datagram sent on the wrong interface advertises
+     * the wrong IP).
      */
     private fun reconcileLanAnnouncement(session: Session) {
         if (!session.isMinecraft || !session.ready) return
+        if (!isCurrentSession(session)) return
         if (!settings.current().minecraftLanDiscovery) {
             if (session.announcerRunning) {
                 stopLanAnnouncement(session)
                 emitConsole(
+                    session.instanceId,
                     LogLevel.INFO,
                     "Minecraft LAN discovery announcement turned off. Clients can still use the " +
                         "LAN address above with Add Server."
@@ -1409,16 +1697,17 @@ class ServerManager(
         }
     }
 
-    private fun emitLanRefreshReport(lan: LanStatus) {
-        lan.warning?.let { emitConsole(LogLevel.WARN, "LAN: $it") }
-        lan.summary?.let { emitConsole(LogLevel.INFO, it) }
-        for (info in lan.probes) emitProbeConsole(info)
+    private fun emitLanRefreshReport(instanceId: String, lan: LanStatus) {
+        lan.warning?.let { emitConsole(instanceId, LogLevel.WARN, "LAN: $it") }
+        lan.summary?.let { emitConsole(instanceId, LogLevel.INFO, it) }
+        for (info in lan.probes) emitProbeConsole(instanceId, info)
     }
 
-    private fun emitProbeConsole(info: LanProbeInfo) {
+    private fun emitProbeConsole(instanceId: String, info: LanProbeInfo) {
         val prefix = "LAN self-test ${info.address}:${info.port}"
         when {
             info.ok -> emitConsole(
+                instanceId,
                 LogLevel.INFO,
                 "$prefix reachable" +
                     (info.latencyMs?.let { " ($it ms)" } ?: "") +
@@ -1427,12 +1716,14 @@ class ServerManager(
                     "or its firewall.)"
             )
             info.result.equals("refused", true) || info.result.equals("timeout", true) -> emitConsole(
+                instanceId,
                 LogLevel.WARN,
                 "$prefix could not connect (${info.result}). The server may be listening on " +
                     "127.0.0.1 only, or a firewall / VPN / router isolation is blocking it. " +
                     "Clear server-ip in server.properties and see the troubleshooting guide."
             )
             else -> emitConsole(
+                instanceId,
                 LogLevel.WARN,
                 "$prefix failed (${info.result}${info.detail?.let { ": $it" } ?: ""})."
             )
@@ -1508,10 +1799,11 @@ class ServerManager(
      */
     private fun startLanAnnouncement(session: Session) {
         if (!session.isMinecraft || session.announcerRunning) return
-        if (session.finalized.get() || synchronized(lock) { this.session } !== session) return
+        if (session.finalized.get() || !isCurrentSession(session)) return
         session.lastAnnounceAttemptAt = System.currentTimeMillis()
         if (!settings.current().minecraftLanDiscovery) {
             emitConsole(
+                session.instanceId,
                 LogLevel.INFO,
                 "Minecraft LAN discovery announcement is OFF. Clients can still use the LAN " +
                     "address above with Add Server, or enable it in Settings."
@@ -1524,7 +1816,8 @@ class ServerManager(
             ServerPropertiesCodec.read(paths.serverProperties(instance.id))[ServerPropertiesCodec.MOTD]
         }.getOrNull()
         val motd = MinecraftLanAnnouncement.sanitizeMotd(motdProperty, instance.name)
-        val announcer = lanAnnouncer ?: MinecraftLanAnnouncer(lanInfo).also { lanAnnouncer = it }
+        val announcer = session.lanAnnouncer
+            ?: MinecraftLanAnnouncer(lanInfo).also { session.lanAnnouncer = it }
         session.announcedInterface =
             runCatching { lanInfo.preferredNetworkInterface()?.name }.getOrNull()
         val started = runCatching {
@@ -1533,13 +1826,14 @@ class ServerManager(
         // Re-check after the slow disk/interface work above: a stop/finish that
         // landed in that window already called stopLanAnnouncement(), so this
         // late start would otherwise become a ghost announcement for a dead run.
-        if (started && (session.finalized.get() || synchronized(lock) { this.session } !== session)) {
+        if (started && (session.finalized.get() || !isCurrentSession(session))) {
             stopLanAnnouncement(session)
             return
         }
         session.announcerRunning = started
         if (started) {
             emitConsole(
+                session.instanceId,
                 LogLevel.INFO,
                 "Minecraft LAN discovery: announcing \"$motd\" on UDP 224.0.2.60:4445 " +
                     "(port $port). The server should appear under \"Scanning for games on your " +
@@ -1547,6 +1841,7 @@ class ServerManager(
             )
         } else {
             emitConsole(
+                session.instanceId,
                 LogLevel.WARN,
                 "Could not start the Minecraft LAN discovery announcement. Clients can still " +
                     "connect by adding the LAN address above manually."
@@ -1556,7 +1851,9 @@ class ServerManager(
 
     private fun stopLanAnnouncement(session: Session) {
         session.announcerRunning = false
-        runCatching { lanAnnouncer?.stop() }
+        val announcer = session.lanAnnouncer
+        session.lanAnnouncer = null
+        runCatching { announcer?.stop() }
     }
 
     /**
@@ -1565,6 +1862,7 @@ class ServerManager(
      * binds before the JVM starts and tell the user.
      */
     private fun normalizeMinecraftBindAddress(instance: ServerInstance) {
+        val instanceId = instance.id
         if (!instance.isMinecraft) return
         val file = paths.serverProperties(instance.id)
         if (!file.isFile) return
@@ -1578,6 +1876,7 @@ class ServerManager(
         runCatching { ServerPropertiesCodec.writeText(file, updated, raw) }
             .onSuccess {
                 emitConsole(
+                    instanceId,
                     LogLevel.WARN,
                     "server-ip was \"${current ?: ""}\", which only accepts connections on this " +
                         "phone. Cleared it before launch so other devices can connect (server.properties)."
@@ -1585,6 +1884,7 @@ class ServerManager(
             }
             .onFailure {
                 emitConsole(
+                    instanceId,
                     LogLevel.WARN,
                     "server-ip is set to a phone-only address ($current), so other devices cannot " +
                         "connect. Remove it from server.properties and restart."
@@ -1593,140 +1893,205 @@ class ServerManager(
     }
 
     // =====================================================================
-    // Bedrock Edition bridge (Geyser 19133 -> app 19132)
+    // Bedrock Edition bridge (single owner on 19132 -> Geyser on 19133)
     // =====================================================================
 
-    /**
-     * Decides whether the Bedrock bridge applies to [instance] and prepares
-     * Geyser beforehand:
-     *
-     *  - Geyser is detected from `plugins/` (or `mods/`) and/or its config;
-     *  - when enabled, Geyser's UDP port is moved to [BEDROCK_GEYSER_PORT] in
-     *    `plugins/Geyser-<version>/config.yml` (the original value is remembered in a
-     *    sidecar so disabling the bridge restores it) and the child JVM receives
-     *    `GEYSER_BEDROCK_PORT`/`GEYSER_BEDROCK_ADDRESS` environment overrides
-     *    (Geyser >= 2.12 reads `GEYSER_<PATH>` overrides without touching config);
-     *  - when disabled, a previously patched port is restored.
-     *
-     * Never throws: a failed patch only produces a console warning and the bridge
-     * may still work through the environment override.
-     */
-    private fun prepareBedrockBridge(instance: ServerInstance): BedrockBridgePlan {
-        if (!instance.isMinecraft) {
-            return BedrockBridgePlan(false, false, null, emptyMap())
-        }
+    /** Finds Geyser in `plugins/`/`mods/` and its generated config, if any. */
+    private fun detectGeyser(instance: ServerInstance): GeyserDetection {
+        if (!instance.isMinecraft) return GeyserDetection(null, false)
         val pluginsDir = paths.pluginsDir(instance.id)
-        val geyserConfig = runCatching { BedrockGeyserConfig.findConfigFile(pluginsDir) }.getOrNull()
-        val geyserJar = findPluginJar(pluginsDir, "geyser")
+        val config = runCatching { BedrockGeyserConfig.findConfigFile(pluginsDir) }.getOrNull()
+        val jar = findPluginJar(pluginsDir, "geyser")
             ?: findPluginJar(paths.modsDir(instance.id), "geyser")
-        val geyserDetected = geyserConfig != null || geyserJar != null
-        val bridgeWanted = settings.current().bedrockLanDiscovery && geyserDetected
-        val sidecar = bedrockSidecarFile(instance)
+        return GeyserDetection(config, config != null || jar != null)
+    }
 
-        if (!bridgeWanted) {
-            restoreBedrockPort(geyserConfig, sidecar)
-            return BedrockBridgePlan(false, geyserDetected, geyserConfig, emptyMap())
+    /**
+     * Picks the unique internal Geyser ports for a Minecraft+Geyser session that
+     * does NOT own the Bedrock LAN bridge. Slots 0..4 are checked against the
+     * other active sessions so two Geysers never share a UDP port.
+     */
+    private fun pickBedrockNonOwnerPorts(): BedrockPorts {
+        val used = HashSet<Int>()
+        for (session in sessions.values) {
+            used.add(session.bedrockPlan.geyserInternalPort)
+            used.add(session.bedrockPlan.webrtcPort)
+            used.add(BEDROCK_GEYSER_PORT)
+            used.add(BEDROCK_GEYSER_WEBRTC_PORT)
+        }
+        for (slot in 0 until ServerController.MAX_RUNNING_SERVERS) {
+            val raknet = BEDROCK_NON_OWNER_PORT_BASE + slot
+            val webrtc = BEDROCK_NON_OWNER_WEBRTC_BASE + slot
+            if (raknet !in used && webrtc !in used) return BedrockPorts(raknet, webrtc)
+        }
+        val overflow = ServerController.MAX_RUNNING_SERVERS
+        return BedrockPorts(
+            BEDROCK_NON_OWNER_PORT_BASE + overflow,
+            BEDROCK_NON_OWNER_WEBRTC_BASE + overflow
+        )
+    }
+
+    /**
+     * Decides how Geyser is configured before [instance] is launched:
+     *
+     *  - no Geyser or the feature is disabled: restore a previously patched port
+     *    (recorded in a sidecar file) and launch untouched;
+     *  - this session owns the LAN bridge: move Geyser to [BEDROCK_GEYSER_PORT]
+     *    and pass the environment overrides the bridge expects;
+     *  - another session owns the bridge: move Geyser to a unique internal port
+     *    so two Geyser listeners cannot collide, and warn the user.
+     *
+     * The config edit is byte-preserving and atomic; the environment overrides
+     * work even for Geyser builds that never read the config value. Never throws:
+     * a failed patch only produces a console warning.
+     */
+    private fun prepareBedrockBridge(
+        instance: ServerInstance,
+        bridgeEnabled: Boolean,
+        geyserPort: Int,
+        webrtcPort: Int,
+        geyserDetected: Boolean,
+        geyserConfig: File?,
+        busyOwnerName: String?
+    ): BedrockBridgePlan {
+        val instanceId = instance.id
+        if (!instance.isMinecraft) {
+            return BedrockBridgePlan(
+                requested = false,
+                geyserDetected = false,
+                geyserConfig = null,
+                environment = emptyMap(),
+                geyserInternalPort = BEDROCK_GEYSER_PORT,
+                webrtcPort = BEDROCK_GEYSER_WEBRTC_PORT
+            )
+        }
+        val sidecar = bedrockSidecarFile(instance)
+        val featureOn = settings.current().bedrockLanDiscovery
+        val wanted = featureOn && geyserDetected
+        if (!wanted) {
+            restoreBedrockPort(geyserConfig, sidecar, instanceId)
+            val restoredPort = geyserConfig?.let {
+                runCatching { BedrockGeyserConfig.readBedrockPort(it) }.getOrNull()
+            }
+            return BedrockBridgePlan(
+                requested = false,
+                geyserDetected = geyserDetected,
+                geyserConfig = geyserConfig,
+                environment = emptyMap(),
+                geyserInternalPort = restoredPort ?: BEDROCK_GEYSER_PORT,
+                webrtcPort = BEDROCK_GEYSER_WEBRTC_PORT
+            )
         }
 
+        val targetPort = geyserPort
+        val targetWebrtcPort = webrtcPort
         if (geyserConfig == null) {
             emitConsole(
+                instanceId,
                 LogLevel.INFO,
-                "Bedrock bridge: Geyser has not generated its config yet. JavaHost passes " +
-                    "GEYSER_BEDROCK_PORT=$BEDROCK_GEYSER_PORT to Geyser; if Bedrock LAN discovery does " +
-                    "not work, restart the server once more so JavaHost can also update " +
-                    "plugins/Geyser-Spigot/config.yml."
+                "Bedrock: Geyser has not generated its config yet. JavaHost passes " +
+                    "GEYSER_BEDROCK_PORT=$targetPort to Geyser; if Bedrock LAN discovery does not " +
+                    "work, restart the server once more so JavaHost can also update " +
+                    "plugins/Geyser-*/config.yml."
             )
         } else {
             val current = runCatching { BedrockGeyserConfig.readBedrockPort(geyserConfig) }.getOrNull()
+            val outcome = runCatching {
+                BedrockGeyserConfig.prepareForBridge(geyserConfig, targetPort, targetWebrtcPort)
+            }.getOrNull()
             when {
                 current == null -> emitConsole(
+                    instanceId,
                     LogLevel.WARN,
-                    "Bedrock bridge: could not find bedrock.port in " +
+                    "Bedrock: could not find bedrock.port in " +
                         "${BedrockGeyserConfig.describe(geyserConfig)}. JavaHost passes " +
-                        "GEYSER_BEDROCK_PORT=$BEDROCK_GEYSER_PORT (Geyser 2.12+); if Bedrock clients " +
-                        "cannot join, set bedrock.port: $BEDROCK_GEYSER_PORT manually and restart."
+                        "GEYSER_BEDROCK_PORT=$targetPort (Geyser 2.12+); if Bedrock clients cannot " +
+                        "join, set bedrock.port: $targetPort manually and restart."
                 )
-                current != BEDROCK_GEYSER_PORT -> {
-                    val outcome = runCatching {
-                        BedrockGeyserConfig.prepareForBridge(
-                            geyserConfig,
-                            BEDROCK_GEYSER_PORT,
-                            BEDROCK_GEYSER_WEBRTC_PORT
-                        )
-                    }.getOrNull()
-                    if (outcome?.changed == true) {
-                        outcome.originalPort?.let { writeSidecarPort(sidecar, it) }
-                        val transportNote = if (outcome.transportPatched) {
-                            " and set transport to \"$BEDROCK_GEYSER_TRANSPORT\" (Geyser 2.12.1 defaults to NetherNet, " +
-                                "which disables the RakNet listener the bridge needs)"
-                        } else {
-                            ""
-                        }
-                        val webrtcNote = if (outcome.webrtcPortPatched) {
-                            " (NetherNet WebRTC UDP moved to $BEDROCK_GEYSER_WEBRTC_PORT)"
-                        } else {
-                            ""
-                        }
-                        emitConsole(
-                            LogLevel.INFO,
-                            "Bedrock bridge: moved Geyser from UDP $current to UDP $BEDROCK_GEYSER_PORT$transportNote" +
-                                "$webrtcNote in ${BedrockGeyserConfig.describe(geyserConfig)} so JavaHost can " +
-                                "answer Bedrock LAN pings on UDP $BEDROCK_RELAY_PORT. Disable the Bedrock LAN " +
-                                "bridge (Settings) to restore the old UDP port; the original value is saved."
-                        )
+                outcome == null -> emitConsole(
+                    instanceId,
+                    LogLevel.WARN,
+                    "Bedrock: could not update Geyser's UDP port/transport in " +
+                        "${BedrockGeyserConfig.describe(geyserConfig)}. JavaHost passes " +
+                        "GEYSER_BEDROCK_PORT=$targetPort, GEYSER_BEDROCK_TRANSPORT=$BEDROCK_GEYSER_TRANSPORT " +
+                        "and GEYSER_BEDROCK_WEBRTC_PORT=$targetWebrtcPort; with Geyser older than 2.12 " +
+                        "set bedrock.port: $targetPort manually and restart."
+                )
+                outcome.changed -> {
+                    outcome.originalPort?.let { writeSidecarPort(sidecar, it) }
+                    val transportNote = if (outcome.transportPatched) {
+                        " and set transport to \"$BEDROCK_GEYSER_TRANSPORT\" (Geyser 2.12.1 defaults to " +
+                            "NetherNet, which disables the RakNet listener the bridge needs)"
                     } else {
-                        emitConsole(
-                            LogLevel.WARN,
-                            "Bedrock bridge: could not update Geyser's UDP port/transport in " +
-                                "${BedrockGeyserConfig.describe(geyserConfig)} " +
-                                "(${outcome?.message ?: "unknown error"}). JavaHost passes " +
-                                "GEYSER_BEDROCK_PORT=$BEDROCK_GEYSER_PORT, " +
-                                "GEYSER_BEDROCK_TRANSPORT=$BEDROCK_GEYSER_TRANSPORT and " +
-                                "GEYSER_BEDROCK_WEBRTC_PORT=$BEDROCK_GEYSER_WEBRTC_PORT; with Geyser older " +
-                                "than 2.12 set bedrock.port: $BEDROCK_GEYSER_PORT manually and restart."
-                        )
+                        ""
                     }
-                }
-                else -> {
-                    // Already on the bridge port. Still make sure the RakNet
-                    // transport exists (Geyser 2.12.1 defaults to NetherNet) and
-                    // that NetherNet has its own UDP port.
-                    val outcome = runCatching {
-                        BedrockGeyserConfig.prepareForBridge(
-                            geyserConfig,
-                            BEDROCK_GEYSER_PORT,
-                            BEDROCK_GEYSER_WEBRTC_PORT
-                        )
-                    }.getOrNull()
-                    if (outcome != null && (outcome.transportPatched || outcome.webrtcPortPatched)) {
-                        emitConsole(
-                            LogLevel.INFO,
-                            "Bedrock bridge: updated " +
-                                "${BedrockGeyserConfig.describe(geyserConfig)} to transport " +
-                                "$BEDROCK_GEYSER_TRANSPORT and/or webrtc-port $BEDROCK_GEYSER_WEBRTC_PORT " +
-                                "so RakNet stays available for Bedrock LAN discovery."
-                        )
+                    val webrtcNote = if (outcome.webrtcPortPatched) {
+                        " (NetherNet WebRTC UDP moved to $targetWebrtcPort)"
+                    } else {
+                        ""
                     }
+                    emitConsole(
+                        instanceId,
+                        LogLevel.INFO,
+                        "Bedrock: moved Geyser from UDP $current to UDP $targetPort$transportNote" +
+                            "$webrtcNote in ${BedrockGeyserConfig.describe(geyserConfig)}. " +
+                            "The original port is saved so disabling the bridge restores it."
+                    )
                 }
+                outcome.transportPatched || outcome.webrtcPortPatched -> emitConsole(
+                    instanceId,
+                    LogLevel.INFO,
+                    "Bedrock: updated ${BedrockGeyserConfig.describe(geyserConfig)} to transport " +
+                        "$BEDROCK_GEYSER_TRANSPORT and/or webrtc-port $targetWebrtcPort so RakNet stays " +
+                        "available for Bedrock LAN discovery."
+                )
+                else -> Unit
             }
         }
-
         emitConsole(
+            instanceId,
             LogLevel.INFO,
-            "Bedrock bridge: Bedrock clients connect to UDP $BEDROCK_RELAY_PORT; Geyser is reached " +
-                "internally on UDP $BEDROCK_GEYSER_PORT."
+            if (bridgeEnabled) {
+                "Bedrock bridge: Bedrock clients connect to UDP $BEDROCK_RELAY_PORT; Geyser is " +
+                    "reached internally on UDP $targetPort."
+            } else {
+                "Bedrock: the LAN bridge is used by $busyOwnerName; this server's Geyser listens on " +
+                    "UDP $targetPort so both servers can run at the same time."
+            }
         )
         return BedrockBridgePlan(
-            requested = true,
+            requested = bridgeEnabled,
             geyserDetected = true,
             geyserConfig = geyserConfig,
             environment = mapOf(
-                "GEYSER_BEDROCK_PORT" to BEDROCK_GEYSER_PORT.toString(),
+                "GEYSER_BEDROCK_PORT" to targetPort.toString(),
                 "GEYSER_BEDROCK_ADDRESS" to "0.0.0.0",
                 "GEYSER_BEDROCK_TRANSPORT" to BEDROCK_GEYSER_TRANSPORT,
-                "GEYSER_BEDROCK_WEBRTC_PORT" to BEDROCK_GEYSER_WEBRTC_PORT.toString()
-            )
+                "GEYSER_BEDROCK_WEBRTC_PORT" to targetWebrtcPort.toString()
+            ),
+            geyserInternalPort = targetPort,
+            webrtcPort = targetWebrtcPort
         )
+    }
+
+    /** Initial per-session Bedrock status published before Geyser answers. */
+    private fun initialBedrockStatus(
+        plan: BedrockBridgePlan,
+        busyOwnerName: String?
+    ): BedrockLanStatus = when {
+        plan.requested -> BedrockLanStatus(
+            geyserDetected = true,
+            bridgeRequested = true,
+            relayPort = BEDROCK_RELAY_PORT
+        )
+        plan.geyserDetected && busyOwnerName != null -> BedrockLanStatus(
+            geyserDetected = true,
+            bridgeRequested = false,
+            warning = "Bedrock LAN bridge is in use by $busyOwnerName; this server's Geyser uses " +
+                "UDP ${plan.geyserInternalPort} — add it manually in Bedrock for that server."
+        )
+        plan.geyserDetected -> BedrockLanStatus(geyserDetected = true, bridgeRequested = false)
+        else -> BedrockLanStatus()
     }
 
     /** First JAR in [dir] whose file name contains [needle] (case-insensitive). */
@@ -1749,45 +2114,53 @@ class ServerManager(
 
     /**
      * Restores a Geyser port this app previously moved, when the bridge is now
-     * off. Only restores when the file still holds [BEDROCK_GEYSER_PORT] so a
+     * off. Only restores when the file still holds the port we patched so a
      * user's later manual change is never overwritten.
      */
-    private fun restoreBedrockPort(geyserConfig: File?, sidecar: File) {
+    private fun restoreBedrockPort(geyserConfig: File?, sidecar: File, instanceId: String) {
         if (!sidecar.isFile) return
         val original = readSidecarPort(sidecar)
         if (original != null && geyserConfig != null) {
-            val restored = runCatching {
-                BedrockGeyserConfig.restorePort(geyserConfig, BEDROCK_GEYSER_PORT, original)
-            }.getOrDefault(false)
-            if (restored) {
-                emitConsole(
-                    LogLevel.INFO,
-                    "Bedrock bridge is off: restored Geyser's UDP port to $original in " +
-                        "${BedrockGeyserConfig.describe(geyserConfig)}."
-                )
+            val current = runCatching { BedrockGeyserConfig.readBedrockPort(geyserConfig) }.getOrNull()
+            if (current != null) {
+                val restored = runCatching {
+                    BedrockGeyserConfig.restorePort(geyserConfig, current, original)
+                }.getOrDefault(false)
+                if (restored) {
+                    emitConsole(
+                        instanceId,
+                        LogLevel.INFO,
+                        "Bedrock bridge is off: restored Geyser's UDP port to $original in " +
+                            "${BedrockGeyserConfig.describe(geyserConfig)}."
+                    )
+                }
             }
         }
         runCatching { sidecar.delete() }
     }
 
     /**
-     * Binds UDP 19132 and starts relaying to Geyser on 19133. Called from the
-     * stats loop once the server is ready (so Geyser has already bound its port,
-     * which avoids a bind race on the very first run after enabling the bridge).
+     * Binds UDP 19132 and starts relaying to the owner session's Geyser port.
+     * Called from the stats loop once the server is ready (so Geyser has already
+     * bound its port, which avoids a bind race on the very first run).
      */
     private fun startBedrockBridge(session: Session) {
         if (!session.bedrockPlan.requested || session.bedrockRelayStarted) return
-        if (session.finalized.get() || synchronized(lock) { this.session } !== session) return
+        if (session.finalized.get() || !isCurrentSession(session)) return
+        if (synchronized(lock) { bedrockOwnerId } != session.instanceId) return
         session.bedrockLastAttemptAt = System.currentTimeMillis()
+        val geyserPort = session.bedrockPlan.geyserInternalPort
         val relay = BedrockLanRelay(
             listenPort = BEDROCK_RELAY_PORT,
             upstreamHost = BEDROCK_UPSTREAM_HOST,
-            upstreamPort = BEDROCK_GEYSER_PORT,
+            upstreamPort = geyserPort,
             // Reply-only (Phantom-style): unsolicited pong broadcasts are untested
             // against real clients and can confuse the LAN list.
             beaconIntervalMs = 0L,
             broadcastProvider = { bedrockBroadcastTargets() },
-            onError = { message -> emitConsole(LogLevel.DEBUG, "Bedrock bridge: $message") }
+            onError = { message ->
+                emitConsole(session.instanceId, LogLevel.DEBUG, "Bedrock bridge: $message")
+            }
         )
         val started = runCatching { relay.start() }.getOrDefault(false)
         if (!started) {
@@ -1795,30 +2168,30 @@ class ServerManager(
                 ?: "<phone-ip>:$BEDROCK_RELAY_PORT"
             val warning = "The Bedrock LAN bridge could not bind UDP $BEDROCK_RELAY_PORT. Another app " +
                 "may already use that port, or Geyser is still listening on $BEDROCK_RELAY_PORT " +
-                "(JavaHost could not move it to $BEDROCK_GEYSER_PORT). Bedrock clients can still join " +
+                "(JavaHost could not move it to $geyserPort). Bedrock clients can still join " +
                 "manually at $address if Geyser is reachable."
             session.bedrockStatus = session.bedrockStatus.copy(
                 relayRunning = false,
                 geyserReachable = false,
                 endpoints = bedrockEndpoints(),
-                directEndpoints = bedrockDirectEndpoints(),
+                directEndpoints = bedrockDirectEndpoints(geyserPort),
                 warning = warning
             )
             // One warning per session: a 2 s retry loop must not flood the console.
             if (!session.bedrockBindWarningEmitted) {
                 session.bedrockBindWarningEmitted = true
-                emitConsole(LogLevel.WARN, "Bedrock bridge: $warning")
+                emitConsole(session.instanceId, LogLevel.WARN, "Bedrock bridge: $warning")
             }
             publishBedrockStatus(session)
             return
         }
         // A late successful bind must not become a ghost relay if the session was
         // stopped/finished while start() was running (mirrors the LAN announcer fix).
-        if (session.finalized.get() || synchronized(lock) { this.session } !== session) {
+        if (session.finalized.get() || !isCurrentSession(session)) {
             runCatching { relay.stop() }
             return
         }
-        bedrockRelay = relay
+        session.bedrockRelay = relay
         session.bedrockRelayStarted = true
         session.bedrockBindWarningEmitted = false
         session.bedrockStartedAt = System.currentTimeMillis()
@@ -1828,9 +2201,10 @@ class ServerManager(
             warning = null
         )
         emitConsole(
+            session.instanceId,
             LogLevel.INFO,
             "Bedrock LAN bridge: listening on UDP $BEDROCK_RELAY_PORT and forwarding to Geyser on " +
-                "UDP $BEDROCK_GEYSER_PORT. Waiting for Geyser to answer the Bedrock ping…"
+                "UDP $geyserPort. Waiting for Geyser to answer the Bedrock ping…"
         )
         publishBedrockStatus(session)
     }
@@ -1842,13 +2216,15 @@ class ServerManager(
             geyserReachable = false,
             endpoints = emptyList()
         )
-        runCatching { bedrockRelay?.stop() }
-        bedrockRelay = null
+        val relay = session.bedrockRelay
+        session.bedrockRelay = null
+        runCatching { relay?.stop() }
     }
 
     private fun publishBedrockStatus(session: Session) {
-        _runtime.update { status ->
-            if (status.instanceId == session.instanceId && isActiveState(status.state)) {
+        if (!isCurrentSession(session)) return
+        updateRuntime(session.instanceId) { status ->
+            if (isActiveState(status.state)) {
                 status.copy(lan = status.lan.copy(bedrock = currentBedrockStatus(session)))
             } else {
                 status
@@ -1857,12 +2233,14 @@ class ServerManager(
     }
 
     /**
-     * Pings Geyser directly to get live Bedrock server info (MOTD, version,
-     * players) and to know whether the bridge can work at all.
+     * Pings the owner session's Geyser directly to get live Bedrock server info
+     * (MOTD, version, players) and to know whether the bridge can work at all.
      */
     private suspend fun refreshBedrock(session: Session) {
-        if (!session.bedrockRelayStarted || session.finalized.get()) return
-        val info = withContext(Dispatchers.IO) { queryBedrockServer(BEDROCK_GEYSER_PORT) }
+        if (!session.bedrockPlan.requested || !session.bedrockRelayStarted) return
+        if (session.finalized.get() || !isCurrentSession(session)) return
+        val geyserPort = session.bedrockPlan.geyserInternalPort
+        val info = withContext(Dispatchers.IO) { queryBedrockServer(geyserPort) }
         val now = System.currentTimeMillis()
         // Keep the bridge address visible even while Geyser is unreachable: it is
         // the documented manual fallback.
@@ -1872,8 +2250,9 @@ class ServerManager(
             if (!session.bedrockReadyEmitted) {
                 session.bedrockReadyEmitted = true
                 val address = endpoints.firstOrNull()?.hostPort ?: "<phone-ip>:$BEDROCK_RELAY_PORT"
-                val direct = bedrockDirectEndpoints().firstOrNull()?.hostPort
+                val direct = bedrockDirectEndpoints(geyserPort).firstOrNull()?.hostPort
                 emitConsole(
+                    session.instanceId,
                     LogLevel.INFO,
                     "Bedrock LAN bridge ready: Bedrock clients on the same Wi-Fi should see the server " +
                         "in LAN/Friends within a few seconds. Manual Add Server for the LAN bridge: " +
@@ -1887,14 +2266,15 @@ class ServerManager(
         } else if (now - session.bedrockStartedAt >= BEDROCK_WARN_AFTER_MS && !session.bedrockWarningEmitted) {
             session.bedrockWarningEmitted = true
             emitConsole(
+                session.instanceId,
                 LogLevel.WARN,
                 "Bedrock bridge: waiting on UDP $BEDROCK_RELAY_PORT but Geyser is not answering RakNet " +
-                    "on UDP $BEDROCK_GEYSER_PORT. Geyser 2.12.1 defaults to the NetherNet transport; " +
+                    "on UDP $geyserPort. Geyser 2.12.1 defaults to the NetherNet transport; " +
                     "JavaHost sets transport: $BEDROCK_GEYSER_TRANSPORT and webrtc-port " +
-                    "$BEDROCK_GEYSER_WEBRTC_PORT, so check plugins/Geyser-Spigot/config.yml and the " +
-                    "console for Geyser bind/config errors (also make sure Floodgate is installed). " +
-                    "Newer Bedrock clients can still join directly with Add Server <phone-ip>:" +
-                    "$BEDROCK_GEYSER_PORT."
+                    "${session.bedrockPlan.webrtcPort}, so check plugins/Geyser-Spigot/config.yml and " +
+                    "the console for Geyser bind/config errors (also make sure Floodgate is " +
+                    "installed). Newer Bedrock clients can still join directly with Add Server " +
+                    "<phone-ip>:$geyserPort."
             )
         }
         session.bedrockStatus = BedrockLanStatus(
@@ -1908,7 +2288,7 @@ class ServerManager(
             protocol = info?.protocol,
             players = info?.let { "${it.players}/${it.maxPlayers}" },
             endpoints = endpoints,
-            directEndpoints = bedrockDirectEndpoints(),
+            directEndpoints = bedrockDirectEndpoints(geyserPort),
             // Bind failures keep their warning from startBedrockBridge(); the
             // "Geyser not answering" case is shown by the UI's status line and
             // logged to the console once, so do not duplicate it here.
@@ -1917,7 +2297,7 @@ class ServerManager(
         publishBedrockStatus(session)
     }
 
-    /** One RakNet ping round-trip to the local Geyser listener; null when it does not answer. */
+    /** One RakNet ping round-trip to a local Geyser listener; null when it does not answer. */
     private fun queryBedrockServer(port: Int): BedrockRakNet.ServerInfo? {
         val socket = DatagramSocket()
         return try {
@@ -1952,16 +2332,16 @@ class ServerManager(
     /**
      * Geyser's own address for Bedrock clients that use the NetherNet transport
      * (Bedrock >= 26.60) and therefore cannot join through the RakNet bridge:
-     * use Add Server with `<phone-ip>:19133`.
+     * use Add Server with `<phone-ip>:<geyserPort>`.
      */
-    private fun bedrockDirectEndpoints(): List<LanEndpointInfo> {
+    private fun bedrockDirectEndpoints(geyserPort: Int): List<LanEndpointInfo> {
         val endpoints = runCatching { lanInfo.endpoints() }.getOrDefault(emptyList())
         return endpoints.map { endpoint ->
             LanEndpointInfo(
                 address = endpoint.address,
                 interfaceName = endpoint.interfaceName,
                 label = endpoint.label,
-                hostPort = "${endpoint.address}:$BEDROCK_GEYSER_PORT"
+                hostPort = "${endpoint.address}:$geyserPort"
             )
         }
     }
@@ -1981,21 +2361,27 @@ class ServerManager(
 
     private fun currentBedrockStatus(session: Session): BedrockLanStatus {
         val plan = session.bedrockPlan
-        return if (plan.requested) {
-            session.bedrockStatus.copy(
-                geyserDetected = true,
-                bridgeRequested = true,
-                relayPort = BEDROCK_RELAY_PORT,
-                directEndpoints = bedrockDirectEndpoints()
-            )
-        } else {
-            BedrockLanStatus(
-                geyserDetected = plan.geyserDetected,
-                bridgeRequested = false
-            )
-        }
+        if (!plan.geyserDetected) return BedrockLanStatus(geyserDetected = false, bridgeRequested = false)
+        return session.bedrockStatus.copy(
+            geyserDetected = true,
+            bridgeRequested = plan.requested,
+            relayPort = if (plan.requested) BEDROCK_RELAY_PORT else null,
+            directEndpoints = bedrockDirectEndpoints(plan.geyserInternalPort)
+        )
     }
 
+    // =====================================================================
+    // Graceful stop
+    // =====================================================================
+
+    /**
+     * Shared graceful/force shutdown for [stop] and [restart].
+     *
+     * Minecraft gets a "stop" command and up to 8 s; generic servers do not get
+     * a fake command (most would not understand it), they simply get a short
+     * 2 s grace before SIGTERM. SIGTERM is followed by SIGKILL after 3 s.
+     * Requests are idempotent and a later `stop(force = true)` escalates.
+     */
     private suspend fun stopSession(session: Session, force: Boolean) {
         if (!session.stopInitiated.compareAndSet(false, true)) {
             withTimeoutOrNull(GRACEFUL_STOP_MAX_MS + 10_000L) { session.finished.await() }
@@ -2010,17 +2396,25 @@ class ServerManager(
         val alive = isProcessAlive(session.process)
         if (alive) {
             if (force) {
-                emitConsole(LogLevel.INFO, "Force stopping the server…")
+                emitConsole(session.instanceId, LogLevel.INFO, "Force stopping the server…")
                 runCatching { session.process.destroy() }
             } else {
                 if (session.isMinecraft) {
                     if (writeStdin(session, "stop")) {
-                        emitConsole(LogLevel.INFO, "Sent stop command; waiting for the server to shut down…")
+                        emitConsole(
+                            session.instanceId,
+                            LogLevel.INFO,
+                            "Sent stop command; waiting for the server to shut down…"
+                        )
                     } else {
-                        emitConsole(LogLevel.WARN, "Could not send the stop command; terminating the process.")
+                        emitConsole(
+                            session.instanceId,
+                            LogLevel.WARN,
+                            "Could not send the stop command; terminating the process."
+                        )
                     }
                 } else {
-                    emitConsole(LogLevel.INFO, "Stopping the server…")
+                    emitConsole(session.instanceId, LogLevel.INFO, "Stopping the server…")
                 }
                 val graceMs = if (session.isMinecraft) GRACEFUL_STOP_MAX_MS else GENERIC_STOP_GRACE_MS
                 val deadline = System.currentTimeMillis() + graceMs
@@ -2032,7 +2426,11 @@ class ServerManager(
             }
             if (!session.exitDeferred.isCompleted) {
                 if (!force) {
-                    emitConsole(LogLevel.WARN, "The server did not stop in time; terminating the process.")
+                    emitConsole(
+                        session.instanceId,
+                        LogLevel.WARN,
+                        "The server did not stop in time; terminating the process."
+                    )
                 }
                 runCatching { session.process.destroy() }
                 val deadline = System.currentTimeMillis() + KILL_GRACE_MS
@@ -2040,7 +2438,11 @@ class ServerManager(
                     delay(WAIT_POLL_MS)
                 }
                 if (!session.exitDeferred.isCompleted) {
-                    emitConsole(LogLevel.WARN, "The process ignored termination; killing it.")
+                    emitConsole(
+                        session.instanceId,
+                        LogLevel.WARN,
+                        "The process ignored termination; killing it."
+                    )
                     forceKill(session)
                 }
             }
@@ -2052,12 +2454,20 @@ class ServerManager(
         // leave the UI/service in STOPPING forever. Kill by pid directly, then
         // finalize the session so the notification and restart path recover.
         if (!session.finished.isCompleted) {
-            emitConsole(LogLevel.WARN, "The server process did not confirm exit; forcing it down.")
+            emitConsole(
+                session.instanceId,
+                LogLevel.WARN,
+                "The server process did not confirm exit; forcing it down."
+            )
             forceKill(session)
             withTimeoutOrNull(KILL_GRACE_MS) { session.finished.await() }
         }
         if (!session.finished.isCompleted) {
-            emitConsole(LogLevel.ERROR, "Could not reap the server process; resetting its session state.")
+            emitConsole(
+                session.instanceId,
+                LogLevel.ERROR,
+                "Could not reap the server process; resetting its session state."
+            )
             runCatching { session.exitDeferred.complete(-1) }
             runCatching { finishSession(session, -1) }
             resetRuntimeAfterForcedStop(session.instanceId)
@@ -2087,7 +2497,7 @@ class ServerManager(
     }
 
     // =====================================================================
-    // Exit handling / crash post-mortem
+    // Exit handling / crash post-mortem (per session)
     // =====================================================================
 
     private fun finishSession(session: Session, exitCode: Int) {
@@ -2119,9 +2529,8 @@ class ServerManager(
             tail = tail,
             reportPath = null
         )
-        var reportPath: String? = null
         if (!expected) {
-            reportPath = runCatching { writeCrashReport(session, exitInfo, duration) }
+            val reportPath = runCatching { writeCrashReport(session, exitInfo, duration) }
                 .getOrNull()?.absolutePath
             if (reportPath != null) exitInfo = exitInfo.copy(reportPath = reportPath)
         }
@@ -2138,15 +2547,20 @@ class ServerManager(
             }
         }
         if (expected) {
-            lastCrash = null
-            emitConsole(LogLevel.INFO, "Server stopped (exit code $exitCode).")
-        } else {
-            lastCrash = exitInfo
             emitConsole(
+                session.instanceId,
+                LogLevel.INFO,
+                "Server stopped (exit code $exitCode)."
+            )
+        } else {
+            emitConsole(
+                session.instanceId,
                 LogLevel.ERROR,
                 "Server exited unexpectedly: ${classified.summary} (exit code $exitCode)"
             )
-            reportPath?.let { emitConsole(LogLevel.ERROR, "Crash report saved to $it") }
+            exitInfo.reportPath?.let {
+                emitConsole(session.instanceId, LogLevel.ERROR, "Crash report saved to $it")
+            }
         }
         val (availMb, totalMb) = deviceMemoryMb()
         val finalStatus = ServerRuntimeStatus(
@@ -2166,13 +2580,34 @@ class ServerManager(
             ready = false,
             lastExit = exitInfo
         )
-        // Clear + publish atomically with respect to start(): a new session must
-        // never be overwritten by the previous run's final status.
+        var nextFocus: String? = null
+        var wasFocused = false
         synchronized(lock) {
-            if (session === this.session) this.session = null
-            _runtime.value = finalStatus
+            val currentInMap = sessions[session.instanceId]
+            if (currentInMap === session) sessions.remove(session.instanceId)
+            if (bedrockOwnerId == session.instanceId) bedrockOwnerId = null
+            // If a replacement session for the same instance already started,
+            // it owns the runtime entry and must not be overwritten.
+            val replacementActive = currentInMap != null && currentInMap !== session
+            if (!replacementActive) {
+                _runtimes.value = _runtimes.value.toMutableMap().apply {
+                    put(session.instanceId, finalStatus)
+                }
+                if (_focusedId.value == session.instanceId) {
+                    wasFocused = true
+                    _runtime.value = finalStatus
+                    nextFocus = sessions.keys.firstOrNull()
+                }
+            }
         }
         session.finished.complete(Unit)
+        if (wasFocused) {
+            if (nextFocus != null) {
+                focus(nextFocus)
+            } else {
+                publishFocusedConsole()
+            }
+        }
     }
 
     private fun writeCrashReport(session: Session, exitInfo: ExitInfo, durationMs: Long): File? {
@@ -2202,17 +2637,59 @@ class ServerManager(
     }
 
     // =====================================================================
-    // Helpers
+    // Port-conflict helpers
     // =====================================================================
 
-    private fun recoverInitialStatus(): ServerRuntimeStatus {
-        val (availMb, totalMb) = deviceMemoryMb()
-        val lastId = settings.current().lastActiveInstanceId
-            ?: return ServerRuntimeStatus(deviceAvailMb = availMb, deviceTotalMb = totalMb)
-        val instance = instances.get(lastId)
-        if (instance == null) {
-            return ServerRuntimeStatus(deviceAvailMb = availMb, deviceTotalMb = totalMb)
+    /**
+     * Minecraft: `server.properties server-port` -> `instance.serverPort` ->
+     * 25565. Generic servers: the instance port (may be null, in which case the
+     * conflict cannot be pre-checked and the child's own bind error is reported).
+     */
+    private fun resolveConfiguredPort(instance: ServerInstance): Int? {
+        if (instance.isMinecraft) {
+            val propertyPort = runCatching {
+                ServerPropertiesCodec.port(ServerPropertiesCodec.read(paths.serverProperties(instance.id)))
+            }.getOrNull()
+            return propertyPort ?: instance.serverPort ?: DEFAULT_MINECRAFT_PORT
         }
+        return instance.serverPort
+    }
+
+    /**
+     * Name of the instance owning [port]: a running session first, then any
+     * instance whose configured port resolves to it. Caller must hold [lock].
+     */
+    private fun portOwnerLocked(port: Int, exceptInstanceId: String?): String? {
+        sessions.values.firstOrNull { session ->
+            session.instanceId != exceptInstanceId && session.resolvedPort == port
+        }?.let { return it.instanceName }
+        return instances.instances.value.firstOrNull { instance ->
+            instance.id != exceptInstanceId && resolveConfiguredPort(instance) == port
+        }?.name
+    }
+
+    override fun portOwner(port: Int, exceptInstanceId: String?): String? {
+        if (port <= 0) return null
+        synchronized(lock) { return portOwnerLocked(port, exceptInstanceId) }
+    }
+
+    private fun portConflictMessage(port: Int, ownerName: String): String =
+        "Port $port is already used by $ownerName. Change server-port in server.properties " +
+            "(Minecraft) or the instance port so both servers can run."
+
+    // =====================================================================
+    // Initial-state recovery / helpers
+    // =====================================================================
+
+    /**
+     * Seeds the per-instance runtime map with the last active instance so the UI
+     * can show a crash banner and the focused console immediately after a cold
+     * start, without ever reporting a running server as active.
+     */
+    private fun recoverInitialRuntimes(): Map<String, ServerRuntimeStatus> {
+        val (availMb, totalMb) = deviceMemoryMb()
+        val lastId = settings.current().lastActiveInstanceId ?: return emptyMap()
+        val instance = instances.get(lastId) ?: return emptyMap()
         val base = ServerRuntimeStatus(
             state = RunState.STOPPED,
             instanceId = lastId,
@@ -2233,10 +2710,9 @@ class ServerManager(
                 tail = emptyList(),
                 reportPath = null
             )
-            lastCrash = exit
-            return base.copy(state = RunState.CRASHED, lastExit = exit)
+            return mapOf(lastId to base.copy(state = RunState.CRASHED, lastExit = exit))
         }
-        return base
+        return mapOf(lastId to base)
     }
 
     private fun isProcessAlive(process: Process): Boolean = try {
@@ -2304,6 +2780,7 @@ class ServerManager(
         @Volatile var playersOnline = 0
         @Volatile var playersMax = 0
         @Volatile var serverPort: Int? = null
+        @Volatile var resolvedPort: Int? = null
         @Volatile var observedSignal: CrashSignal? = null
         @Volatile var eulaPromptSeen = false
         @Volatile var rssHint: Long? = null
@@ -2315,9 +2792,17 @@ class ServerManager(
         @Volatile var announcerRunning = false
         @Volatile var announcedInterface: String? = null
         @Volatile var lastAnnounceAttemptAt = 0L
-        @Volatile var bedrockPlan: BedrockBridgePlan =
-            BedrockBridgePlan(false, false, null, emptyMap())
+        @Volatile var lanAnnouncer: MinecraftLanAnnouncer? = null
+        @Volatile var bedrockPlan: BedrockBridgePlan = BedrockBridgePlan(
+            requested = false,
+            geyserDetected = false,
+            geyserConfig = null,
+            environment = emptyMap(),
+            geyserInternalPort = ServerManager.BEDROCK_GEYSER_PORT,
+            webrtcPort = ServerManager.BEDROCK_GEYSER_WEBRTC_PORT
+        )
         @Volatile var bedrockStatus: BedrockLanStatus = BedrockLanStatus()
+        @Volatile var bedrockRelay: BedrockLanRelay? = null
         @Volatile var bedrockRelayStarted = false
         @Volatile var bedrockStartedAt = 0L
         @Volatile var bedrockLastRefreshAt = 0L
@@ -2362,6 +2847,9 @@ class ServerManager(
         const val BEDROCK_QUERY_TIMEOUT_MS = 800
         const val BEDROCK_PONG_BUFFER = 2048
         const val BEDROCK_SIDECAR_NAME = ".javahost-geyser-bedrock-port"
+        const val BEDROCK_NON_OWNER_PORT_BASE = 19140
+        const val BEDROCK_NON_OWNER_WEBRTC_BASE = 19145
+        const val DEFAULT_MINECRAFT_PORT = 25565
         const val LAN_READY_SETTLE_MS = 750L
         const val LAN_PROBE_TIMEOUT_MS = 2_500
         const val ANNOUNCE_RETRY_MS = 30_000L

@@ -2,17 +2,17 @@
 
 **A general-purpose Java server host for Android.** Import a `.jar`, choose a
 Java runtime and a heap, and host Minecraft Java servers (Vanilla, Paper, Fabric,
-Forge …) or any other executable Java server from your phone — no root, no
-Termux, no PC required.
+Forge …) or any other executable Java server from your phone — up to five at the
+same time, no root, no Termux, no PC required.
 
 Built with Kotlin + Jetpack Compose. Target: **arm64-v8a, Android 8.0+ (API 26),
 no root**. The APK is intended for GitHub/F-Droid-style sideloading; see
 [Why targetSdk 28](docs/ARCHITECTURE.md#why-the-app-targets-api-28).
 
-> **Status:** functional MVP, buildable and tested. **424 hermetic unit tests
+> **Status:** functional MVP, buildable and tested. **448 hermetic unit tests
 > (0 failures, 3 environment-gated skips)**; debug and signed release APKs
-> are built. The current release is **1.4.1** (versionCode 12, Home-screen
-> cleanup + reliable stop/start/restart + light theme); see
+> are built. The current release is **1.5.0** (versionCode 13, up to 5 servers
+> at once, port-conflict guard and theme picker); see
 > [CHANGELOG.md](CHANGELOG.md). Minecraft
 > (Vanilla 1.20.4, Paper 1.20.4, Fabric 1.20.4), a generic Java server (WireMock)
 > and a purpose-built sample HTTP server were booted on an Android/bionic
@@ -154,9 +154,31 @@ no root**. The APK is intended for GitHub/F-Droid-style sideloading; see
 - Ships a real non-Minecraft test target (a tiny HTTP server) and was validated
   with [WireMock](https://wiremock.org/) standalone.
 
+### Multi-server hosting (1.5.0)
+- **Up to 5 servers run at once**, each as its own child JVM with its own
+  console, live status, port and `logs/console.log`. Start, Stop, Restart and
+  Force Stop are per server; one server stopping never touches the others.
+- **One active panel per running server** on Home (tap a panel to focus it), with
+  running servers removed from the “Servers” list until they stop, and an
+  “N running / 5” indicator.
+- **Focused console & notification:** the console screen and the ongoing
+  notification follow the focused server; the notification also shows
+  “N servers running” and offers **Stop focused**, **Restart focused** and
+  **Stop all**.
+- **Port-conflict guard:** every running server must use a different port.
+  Setup/edit warns when a port is already configured on another instance, and a
+  start with a conflicting port is rejected with a message naming the owner.
+  Minecraft uses `server-port` from `server.properties` (fallback instance port,
+  then 25565); generic servers use their instance port.
+- **Memory note:** each server keeps its own configured heap. Five 1.5 GB JVMs
+  need ~7.5 GB plus Android, so use smaller heaps (512–1024 MB for small worlds)
+  and check the Device RAM card; JavaHost limits each server, not the total.
+
 ### Process persistence & forensics
-- Foreground service (`specialUse`) with a persistent notification: status,
-  uptime, players, JVM heap, device RAM, **Stop** and **Restart** actions.
+- Foreground service (`specialUse`) with a persistent notification: focused
+  server status, uptime, players, JVM heap, device RAM and the running count,
+  **Stop focused**, **Restart focused**, **Stop all** (plus the per-server
+  controls on the server screen).
 - **Reliable Stop → Start / Restart:** the foreground service no longer disposes
   the process-wide server manager when it goes idle, so stopping a server never
   requires closing the app. Start pressed while “Stopping…” is showing is queued
@@ -164,10 +186,12 @@ no root**. The APK is intended for GitHub/F-Droid-style sideloading; see
   it cannot kill the JVM it just started. Stale runtime state is recovered
   automatically with an internal force-stop.
 - **Bounded stop:** a Minecraft server gets ~8 s to save and exit, then
-  `SIGTERM`, then a 2 s grace before `SIGKILL`; the notification clears as soon
-  as the server is down (normally under 2 s). The manual **Force stop** action
-  remains for a genuinely stuck child.
-- Partial `WakeLock` + `WifiLock` for the server lifetime.
+  `SIGTERM`, then a 2 s grace before `SIGKILL`; the stopped server drops out as
+  soon as it is down (normally under 2 s), and the notification stays only while
+  another server is still running. The manual **Force stop** action remains for a
+  genuinely stuck child.
+- Partial `WakeLock` + `WifiLock` held while any child JVM runs (one lock set for
+  all sessions).
 - Battery-optimization exemption flow and Android 12+ Phantom Process Killer
   guidance with deep links, copyable ADB commands and OEM-agnostic wording.
 - Continuous console mirror to `logs/console.log` with rotation; on unexpected
@@ -185,13 +209,20 @@ no root**. The APK is intended for GitHub/F-Droid-style sideloading; see
   safe.
 - The working directory is app-private; no `MANAGE_EXTERNAL_STORAGE` is needed.
 
-### Look & feel (1.4.0)
-- **New light theme:** a warm cream background (`#F0E4C8`) with a brown accent
-  (`#5A4C39`); cards use a slightly lighter cream so they separate, and all text
-  stays dark-brown/readable. **Dark mode is unchanged** (ink/teal).
-- **Active-server accent:** the active server card, its `RUNNING` state pill and
-  the active server's status card use the accent colour, while inactive cards
-  look the same as before.
+### Themes (1.5.0)
+- **Theme picker in Settings → Appearance** with nine choices, applied
+  immediately: **System** (default), **Light** (1.4.0's cream `#F0E4C8` /
+  brown `#5A4C39` palette), **Dark** (the ink/teal palette), **Material You**
+  (Android 12+ dynamic colours; falls back to System when unavailable), and five
+  custom palettes in both light and dark variants:
+  - **Monochromatic Blue** `#1A73E8` / `#4A90D9` / `#E8F0FE`
+  - **Energy** `#2C3E50` / `#E67E22` / `#F1C40F`
+  - **Triadic** `#00B4DB` / `#FF6B6B` / `#F9CA24`
+  - **Analog Green** `#27AE60` / `#2980B9` / `#1ABC9C`
+  - **High Contrast Black** `#000000` / `#FFC107` / `#FFFFFF`
+- Palette hexes are primary / secondary / tertiary. The active server card,
+  `RUNNING` pill and active status card use the selected theme's accent; themes
+  are stored as pure-JVM palette data so colour values are unit-tested.
 
 ### First-run wizard
 Device summary → Java runtime install → notification permission → battery
@@ -211,12 +242,17 @@ exemption → Phantom Process Killer guidance → optional Minecraft EULA → do
   bridge; Geyser's direct port `19133` is the fallback for NetherNet-era clients;
   Java clients use the Java port (25565 by default). The bridge sets Geyser's
   `transport: both` (RakNet + NetherNet) automatically.
+- **Running several servers:** up to 5 child JVMs at once, each with its own
+  configured heap. JavaHost limits each server's heap but does not reserve the
+  total, so plan for the sum plus Android: five 1.5 GB servers need ~7.5 GB and
+  will not fit comfortably on a 6–8 GB phone — use 512–1024 MB heaps for small
+  worlds. Two or three servers are comfortable on most devices.
 
 ## Build
 
 ```bash
 # JDK 17+ and Android SDK 34 required.
-./gradlew :app:testDebugUnitTest   # 424 hermetic tests
+./gradlew :app:testDebugUnitTest   # 448 hermetic tests
 ./gradlew :app:assembleDebug       # app/build/outputs/apk/debug/app-debug.apk
 ./gradlew :app:assembleRelease     # unsigned; sign with apksigner for distribution
 ```
@@ -297,34 +333,45 @@ Unit tests (all hermetic, no network/device):
     ~10 s is `SIGKILL`ed; the console says so and the last few seconds of unsaved
     world changes can be lost. This is deliberate — it keeps Stop fast and lets
     Start work again without restarting the app.
+11. **Five JVMs need memory and battery headroom.** Each server keeps its own
+    heap and JavaHost does not reserve the total, so five servers can exhaust
+    RAM and be OOM-killed; use smaller heaps, watch the Device RAM card, keep the
+    power guide/battery exemption in place and expect more heat and battery
+    drain. The notification and console show one focused server at a time.
+12. **The Bedrock LAN bridge is single-server.** Only the first running
+    Minecraft session with Geyser can own UDP `19132` (the later one is warned
+    and keeps its Java server running without the Bedrock bridge); Java LAN
+    discovery is announced per session. Run one Bedrock-bridged server at a time.
 
-Also: aarch64 only; no root; one child JVM at a time; first Paper boot downloads
-its libraries and can take a while; JNA warnings may still appear on some server
-versions even though the server runs.
+Also: aarch64 only; no root; **up to 5 child JVMs at once**; first Paper boot
+downloads its libraries and can take a while; JNA warnings may still appear on
+some server versions even though the server runs.
 
 ## Troubleshooting
 
+- I can't start a second server / “port already in use”
+- Only some of my servers run at once (5-server limit / memory)
 - Stop → Start did nothing until the app was restarted (fixed in 1.4.0)
 - Stop still stuck / server will not die
+- Themes look wrong / Material You falls back to System
 - Plugins (Geyser/Floodgate/ViaVersion) installed but not loading
 - Server does not appear in Minecraft / other devices cannot connect
 - Bedrock clients cannot see or join the server (LAN/Friends)
 - Server visible in Minecraft but join fails
 
 See [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md) for the server-flavor /
-loader matrix, the LAN card and join checklists. JavaHost 1.4.1 removes the
-duplicate Home-screen entry for the running server; 1.4.0 makes Stop → Start work
-without closing the app (revivable manager, queued start, one-operation restart,
-bounded stop) and adds the light theme; 1.3.0 added the Bedrock LAN bridge on top
-of the 1.2.0 LAN work. v1.4.1 is an **in-place upgrade of 1.4.0** (same signing
-key), so settings, instances and worlds are kept.
+loader matrix, port-conflict, multi-server, theme and join checklists. JavaHost
+1.5.0 adds up to 5 concurrent servers, the port-conflict guard and the theme
+picker; 1.4.0 made Stop → Start work without closing the app and added the light
+theme; 1.3.0 added the Bedrock LAN bridge. v1.5.0 is an **in-place upgrade of
+1.4.1** (same signing key), so settings, instances and worlds are kept.
 
 ## Project layout
 
 ```
 app/src/main/java/dev/javahost/
   core/api/          ServerController, JreController, Downloader contracts
-  core/model/        domain + UI-support models
+  core/model/        domain + UI-support models, theme palettes
   core/storage/      Paths, InstanceStore, SettingsStore, FileBrowser, codecs
   core/runtime/      Termux index/deb extraction, JreManager, permissions
   core/jar/          JarInspector (Android-free)

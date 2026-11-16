@@ -119,7 +119,7 @@ fun PropertiesScreen(
 
     val draft = remember(instance.id) { mutableStateMapOf<String, String>() }
 
-    val running = state.runtime.instanceId == instance.id && state.runtime.state == RunState.RUNNING
+    val running = state.runtimeFor(instance.id).state == RunState.RUNNING
 
     LaunchedEffect(instance.id, loadKey) {
         loading = true
@@ -336,6 +336,16 @@ fun PropertiesScreen(
                         keyboardType = KeyboardType.Number,
                         supportingText = "Default ${PROPERTY_DEFAULTS["server-port"]} · 1–65535"
                     )
+                    val draftPort = draft["server-port"]?.trim()?.toIntOrNull()
+                    val portConflict = draftPort?.let { state.portConflictFor(it, instance.id) }
+                    if (draftPort != null && portConflict != null) {
+                        Text(
+                            "Port $draftPort is already used by ${portConflict.name}. Use a different " +
+                                "port or the servers cannot run at the same time.",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = javaHostStatusColors().warning
+                        )
+                    }
                     LabeledField(
                         label = "Bind address (server-ip)",
                         value = draft["server-ip"] ?: "",

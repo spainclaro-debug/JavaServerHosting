@@ -6,6 +6,8 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.viewModels
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
 import dev.javahost.ui.AppRoot
 import dev.javahost.ui.AppViewModel
 import dev.javahost.ui.theme.JavaHostTheme
@@ -19,7 +21,8 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         handleServerIntent(intent)
         setContent {
-            JavaHostTheme {
+            val state by viewModel.state.collectAsState()
+            JavaHostTheme(state.settings.theme) {
                 AppRoot(viewModel)
             }
         }

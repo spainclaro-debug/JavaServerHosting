@@ -40,6 +40,7 @@ import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import dev.javahost.core.api.ServerController
 import dev.javahost.core.model.BedrockLanStatus
 import dev.javahost.core.model.ExitInfo
 import dev.javahost.core.model.LanEndpointInfo
@@ -81,7 +82,9 @@ fun ServerDetailScreen(
     onOpenJre: () -> Unit
 ) {
     val live = state.instance(instance.id) ?: instance
-    val runtime = state.runtime
+    // Per-instance runtime: several servers can run at once, so never use the
+    // focused runtime here.
+    val runtime = state.runtimeFor(live.id)
     val uriHandler = LocalUriHandler.current
     val statusColors = javaHostStatusColors()
     val isThisActive = runtime.instanceId == live.id && runtime.isActive
@@ -96,8 +99,18 @@ fun ServerDetailScreen(
     val running = isThisActive && runtime.state == RunState.RUNNING
     val jreInstalled = state.isInstalled(live.jreMajor)
     val eulaOk = !live.isMinecraft || live.eulaAccepted
-    val anotherActive = runtime.isActive && runtime.instanceId != live.id
-    val canStart = !isThisActive && !anotherActive && jreInstalled && eulaOk
+    val atRunningLimit = !isThisActive &&
+        state.runningCount >= ServerController.MAX_RUNNING_SERVERS
+    val canStart = !isThisActive && !atRunningLimit && jreInstalled && eulaOk
+    // Port-conflict warning: this instance's configured port is claimed by another one.
+    // Scanning every instance keeps it symmetric when two instances share a port.
+    val livePort = state.instancePorts[live.id]
+    val portConflictOwner = livePort?.let { state.portConflictFor(it, live.id)?.name }
+    // Focusing first makes the console screen show this instance's console.
+    val openConsole = {
+        actions.focusConsole(live.id)
+        onConsole()
+    }
 
     var showDelete by remember { mutableStateOf(false) }
     var showRename by remember { mutableStateOf(false) }
@@ -112,9 +125,8 @@ fun ServerDetailScreen(
     var autoMemory by remember(live.id, live.autoMemory) { mutableStateOf(live.autoMemory) }
 
     val crashInfo: ExitInfo? = state.lastCrash?.takeIf { crash ->
-        (live.lastExitAt != null && crash.timestamp == live.lastExitAt) ||
-            (runtime.instanceId == live.id && !crash.expected) ||
-            (state.activeInstanceId == live.id && !crash.expected)
+        state.lastCrashInstanceId == live.id ||
+            (live.lastExitAt != null && crash.timestamp == live.lastExitAt)
     }
     val showCrash = live.lastCrashSummary != null || (crashInfo != null && !crashInfo.expected)
 
@@ -187,7 +199,7 @@ fun ServerDetailScreen(
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     if (isThisActive) {
                         Button(
-                            onClick = { actions.stopServer(false) },
+                            onClick = { actions.stopServer(live.id) },
                             modifier = Modifier.weight(1f),
                             enabled = runtime.state != RunState.STOPPING
                         ) { Text("Stop") }
@@ -199,7 +211,7 @@ fun ServerDetailScreen(
                         ) { Text("Start") }
                     }
                     OutlinedButton(
-                        onClick = { actions.restartServer() },
+                        onClick = { actions.restartServer(live.id) },
                         modifier = Modifier.weight(1f),
                         enabled = isThisActive
                     ) { Text("Restart") }
@@ -212,7 +224,8 @@ fun ServerDetailScreen(
                 }
                 if (!isThisActive) {
                     val reason = when {
-                        anotherActive -> "Another server is running. Only one JVM is hosted at a time."
+                        atRunningLimit -> "${ServerController.MAX_RUNNING_SERVERS} servers are already " +
+                            "running. Stop one before starting another."
                         !jreInstalled -> "Install Java ${live.jreMajor} before starting this server."
                         !eulaOk -> "Accept the Minecraft EULA below before starting."
                         else -> null
@@ -221,8 +234,16 @@ fun ServerDetailScreen(
                         Text(reason, style = MaterialTheme.typography.labelSmall, color = statusColors.warning)
                     }
                 }
+                if (portConflictOwner != null) {
+                    Text(
+                        "Port $livePort is already used by $portConflictOwner. Change the port here " +
+                            "or on the other server, or they cannot run at the same time.",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = statusColors.warning
+                    )
+                }
                 if (running) {
-                    TextButton(onClick = onConsole) { Text("Open live console") }
+                    TextButton(onClick = openConsole) { Text("Open live console") }
                 }
             }
 
@@ -263,7 +284,7 @@ fun ServerDetailScreen(
                         Text(summary, style = MaterialTheme.typography.bodyMedium)
                     }
                     OutlinedButton(
-                        onClick = { actions.probeLan() },
+                        onClick = { actions.probeLan(live.id) },
                         modifier = Modifier.fillMaxWidth()
                     ) { Text("Test LAN reachability") }
                     if (lan.probes.isNotEmpty()) {
@@ -358,9 +379,9 @@ fun ServerDetailScreen(
                         Button(
                             onClick = { actions.startServer(live.id) },
                             modifier = Modifier.weight(1f),
-                            enabled = jreInstalled && eulaOk && !anotherActive
+                            enabled = jreInstalled && eulaOk && !atRunningLimit
                         ) { Text("Restart") }
-                        OutlinedButton(onClick = onConsole, modifier = Modifier.weight(1f)) {
+                        OutlinedButton(onClick = openConsole, modifier = Modifier.weight(1f)) {
                             Text("Console")
                         }
                     }
@@ -389,7 +410,7 @@ fun ServerDetailScreen(
             /* ---------------- Tools ---------------- */
             SectionCard(title = "Tools") {
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    OutlinedButton(onClick = onConsole, modifier = Modifier.weight(1f)) { Text("Console") }
+                    OutlinedButton(onClick = openConsole, modifier = Modifier.weight(1f)) { Text("Console") }
                     OutlinedButton(onClick = onFiles, modifier = Modifier.weight(1f)) { Text("Files") }
                 }
                 if (live.isMinecraft) {
@@ -566,7 +587,7 @@ fun ServerDetailScreen(
                 "Stop has not completed.",
             confirmLabel = "Force stop",
             destructive = true,
-            onConfirm = { actions.forceStopServer() },
+            onConfirm = { actions.forceStopServer(live.id) },
             onDismiss = { showForceStop = false }
         )
     }

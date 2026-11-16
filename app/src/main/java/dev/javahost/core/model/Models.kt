@@ -25,6 +25,24 @@ enum class ServerFlavor {
 @Serializable
 enum class RunState { STOPPED, STARTING, RUNNING, STOPPING, CRASHED }
 
+/** App-wide colour theme chosen in Settings. */
+@Serializable
+enum class ThemeChoice {
+    /** Follow the system dark/light setting (default). */
+    SYSTEM,
+    /** The warm cream / brown light theme. */
+    LIGHT,
+    /** The teal-on-ink dark theme. */
+    DARK,
+    /** Android 12+ dynamic colours; falls back to [SYSTEM] below Android 12. */
+    MATERIAL_YOU,
+    MONOCHROMATIC_BLUE,
+    ENERGY,
+    TRIADIC,
+    ANALOG_GREEN,
+    HIGH_CONTRAST_BLACK
+}
+
 @Serializable
 enum class ExitReason {
     STOPPED_BY_USER,
@@ -122,6 +140,8 @@ data class AppSettings(
     val termuxMirror: String = "",
     val lastActiveInstanceId: String? = null,
     val consoleLogLimit: Int = 5000,
+    /** Colour theme chosen in Settings; applies immediately. */
+    val theme: ThemeChoice = ThemeChoice.SYSTEM,
     /** Announce a running Minecraft server on the LAN (multicast discovery). */
     val minecraftLanDiscovery: Boolean = true,
     /**

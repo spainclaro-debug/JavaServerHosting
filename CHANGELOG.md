@@ -1,5 +1,89 @@
 # Changelog
 
+## 1.5.0 — 2026-11-16
+
+Adds **multi-server hosting (up to five JVMs at once)**, a **port-conflict
+guard** and a **theme picker**.
+
+### Up to 5 servers at once
+- **Five child JVMs** (`MAX_RUNNING_SERVERS = 5`) can now run at the same time,
+  each with its own console, live status, port and log files. Start, Stop,
+  Restart and Force Stop are per instance; stopping or restarting one server
+  leaves the others running, and the 1.4.0 lifecycle guarantees (queued Start,
+  one-operation Restart, no manager disposal) are preserved per instance.
+- **Focused console:** one instance is “focused” at a time — the console screen,
+  the ongoing notification and the console/status feeds follow it. Opening a
+  console or tapping a Home active-server panel focuses that server.
+- **Home shows one active-server panel per running server**, and running servers
+  are removed from the “Servers” list below (a stopped server returns to the
+  list). A compact “N running / 5” indicator shows the count, and tapping a
+  panel focuses that server.
+- **Notification & crash handling:** the ongoing notification shows the focused
+  server plus an “N servers running” line, with **Stop focused**, **Restart
+  focused** and **Stop all** actions. Per-instance crash alerts and auto-restart
+  budgets still apply.
+
+### Port-conflict guard
+- All running servers must use **different ports**. Minecraft ports are resolved
+  from `server.properties` (`server-port`), then the instance port, then `25565`;
+  generic Java servers use their configured instance port.
+- **Setup/edit warnings:** the port field on the create screen, the Minecraft
+  `server-port` field in the properties editor and the generic port editor warn
+  when the entered port is already configured on another instance (the warning
+  names the owner; it does not block saving).
+- **Start rejection:** starting a server whose resolved port is already used by
+  another configured or running instance is rejected with an actionable message
+  that names the owner and the port to change. The server's own bind error is
+  still classified separately (another app can hold the port outside JavaHost).
+- A sixth start is rejected once five child JVMs are running.
+
+### Theme picker in Settings
+- New **Settings → Appearance** picker with nine choices, applying immediately:
+  - **System** (default, follows the device), **Light** (the 1.4.0 cream
+    `#F0E4C8` / brown `#5A4C39` theme) and **Dark** (the existing ink/teal theme).
+  - **Material You** — Android 12+ dynamic colours (falls back to System when
+    dynamic colour is unavailable, e.g. Android 8–11).
+  - **Monochromatic Blue** `#1A73E8` / `#4A90D9` / `#E8F0FE`;
+    **Energy** `#2C3E50` / `#E67E22` / `#F1C40F`; **Triadic** `#00B4DB` /
+    `#FF6B6B` / `#F9CA24`; **Analog Green** `#27AE60` / `#2980B9` / `#1ABC9C`;
+    **High Contrast Black** `#000000` / `#FFC107` / `#FFFFFF` (primary /
+    secondary / tertiary).
+- Every custom theme has **both light and dark variants**; the active-server card
+  and `RUNNING` pill use the theme's primary/accent. Palettes live in a pure-JVM,
+  unit-tested `ThemePalettes` table so exact colour values are covered by tests
+  (`ThemePalettesTest`).
+- Settings are preserved across the upgrade, so an existing user starts on
+  **System** (or their previous effective light/dark look) until they pick a
+  theme.
+
+- 448 hermetic unit tests (new `ThemePalettesTest` plus four added
+  `ServiceLifecycleDecisionsTest` cases; the resolved-port/`portOwner` rules are
+  review-verified, not unit-tested).
+- **Release note:** the 1.5.0 APK is signed with the same development key as
+  1.4.1, so it installs as an **in-place upgrade**; instances, worlds, plugins,
+  settings and the installed JRE are preserved.
+
+### Known limitations
+- **The Bedrock/Geyser LAN bridge is single-server at a time.** Only the first
+  running Minecraft session with Geyser can own UDP `19132` and the Geyser port
+  move; a later Minecraft+Geyser session is warned (console/LAN card) and keeps
+  its Java server running without the Bedrock bridge. Run one Bedrock-bridged
+  server at a time and use the Java edition for the others.
+- **Java LAN discovery is per session.** Each running Minecraft server announces
+  its own port on multicast `224.0.2.60:4445`, and each generic/Minecraft server
+  has its own LAN card address, so clients may see several entries in the Java
+  LAN list.
+- **Five JVMs need memory and battery headroom.** JavaHost enforces the memory
+  limit per server, not in aggregate: five servers with their configured heaps
+  must fit alongside Android. Use smaller heaps for small worlds/servers, keep
+  the battery exemption and power guide in place, and expect more heat/drain.
+  The notification shows the count, not five consoles at once.
+- **Focus is single:** the notification and console show one (focused) server;
+  switch focus from Home, the console screen or the server screen.
+- **Material You is Android 12+ only** and falls back to System when dynamic
+  colour is unavailable; themed status colours are chosen for readability but a
+  custom theme is a visual choice, not an accessibility certification.
+
 ## 1.4.1 — 2026-11-16
 
 - **The running server is no longer duplicated on Home.** While a server is

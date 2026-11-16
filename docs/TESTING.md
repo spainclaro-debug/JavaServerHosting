@@ -12,10 +12,10 @@ Run:
 ./gradlew :app:testDebugUnitTest
 ```
 
-Final run in this environment for the 1.4.1 suite: **424 hermetic tests,
-0 failures, 0 errors, 3 skipped** (no new tests in this UI-only release; 419
-before 1.4.0; the skipped tests are environment-gated real-archive/real-JRE
-smoke tests that only run when their fixture variables are provided).
+Final run in this environment for the 1.5.0 suite: **448 hermetic tests,
+0 failures, 0 errors, 3 skipped** (424 before this release; the skipped tests are
+environment-gated real-archive/real-JRE smoke tests that only run when their
+fixture variables are provided).
 
 Coverage by area:
 
@@ -29,8 +29,9 @@ Coverage by area:
 | Storage | `ServerPropertiesCodecTest` — `server.properties` parse/format (comments/order/unknown keys), port validation, `server-ip` get/set/loopback-normalisation cases; `FileBrowserSafetyTest` — path/symlink containment |
 | LAN (new in 1.2.0) | `core/net/LanAddressTest` — private-IPv4/loopback checks, cellular/VPN interface rejection, kind classification/labels, dedupe and `WIFI < ETHERNET < HOTSPOT < OTHER` ordering, subnet broadcast maths (`/8`, `/24`, `/32`, invalid), empty/all-filtered input; `core/net/MinecraftLanAnnouncementTest` — message/payload format, MOTD sanitisation, port validation; `core/net/LanProbeTest` — `REACHABLE`/`REFUSED`/`TIMEOUT`/`ERROR` mapping, latency, host/port validation, no exception on bad input; plus the `server-ip` cases in `ServerPropertiesCodecTest` |
 | Bedrock (new in 1.3.0) | `core/net/BedrockRakNetTest` — ping detection/build, pong parse/build, MAGIC and length checks, `MCPE;…` server-id parse/build round-trips with missing ports and unknown trailing fields, pong rewrite (port/GUID, echoed ping time preserved) invalid-input safety; `core/net/BedrockLanRelayTest` — loopback UDP harness: client ping bytes forwarded unchanged and the reply pong rewritten with the advertised port + relay GUID, non-ping datagrams relayed both ways through a mock upstream socket, two clients isolated, busy port (no `SO_REUSEADDR`) makes `start()` return false, a non-positive beacon interval sends no unsolicited pong bytes, idle/stop cleanup; `core/net/BedrockGeyserConfigTest` — config discovery, modern `bedrock:`/`port:` and legacy `bedrock-port:` patching, `prepareForBridge` transport/WebRTC cases (`transport` absent → no-op, `nethernet` → `both`, `webrtc-port 0` → `19134`, idempotent), comments/CRLF/indentation preserved, port-only restore happy/no-op, atomic write |
-| Service lifecycle (new in 1.4.0) | `core/service/ServiceLifecycleDecisionsTest` — exhaustive truth table for `decideStart` (`ADOPT_RUNNING`, `QUEUE_AFTER_STOP`, `CLEAR_STALE_THEN_START`, `START_FRESH`) and `decideRestart` (`RESTART_EXISTING`, `CLEAR_STALE_THEN_START`, `START_FRESH`) over active/stopping/idle runtime states with and without a real session; verifies the stale-runtime and start-during-stop cases that caused the 1.3.0 bug. `ServerManager`'s fast-stop constants/escalation are review-verified; real service timing is manual-only |
-| Theme (new in 1.4.0) | no unit-testable logic: the light/dark Material 3 schemes live in `ui/theme/Theme.kt` and are compile-checked; text contrast, active-card accent and dark-mode regression are verified on-device (manual checklist 6g). The palette values are asserted by inspection against `docs/ARCHITECTURE.md` |
+| Service lifecycle (new in 1.4.0) | `core/service/ServiceLifecycleDecisionsTest` (9 tests) — truth table for `decideStart` (`ADOPT_RUNNING`, `QUEUE_AFTER_STOP`, `CLEAR_STALE_THEN_START`, `START_FRESH`) and `decideRestart` (`RESTART_EXISTING`, `CLEAR_STALE_THEN_START`, `START_FRESH`) over active/stopping/idle runtime states with and without a real session; verifies the stale-runtime and start-during-stop cases that caused the 1.3.0 bug. `ServerManager`'s fast-stop constants/escalation are review-verified; real service timing is manual-only |
+| Multi-server & port guard (new in 1.5.0) | no hermetic tests for the port rules: the resolved-port rules (Minecraft `server.properties` → instance port → 25565; generic instance port), `portOwner(port, except)` and the start rejections (already active, five-session limit, port conflict naming the owner) live in the Android-dependent `ServerManager` and are **review-verified** plus covered by the manual checklist. The per-instance lifecycle decision helper (`ServiceLifecycleDecisionsTest`, 9 tests) is the unit-tested part; real concurrent-JVM behaviour and per-instance notification/auto-restart are manual-only |
+| Themes (1.4.0 → 1.5.0) | `core/model/ThemePalettesTest` (17 tests) — exact ARGB hex values for every custom palette (Monochromatic Blue, Energy, Triadic, Analog Green, High Contrast Black) in light and dark variants, `null` for `SYSTEM`/`MATERIAL_YOU`, all `ThemeChoice` values covered, plus any extracted on-colour/contrast helper cases. `ThemeCatalog`/Material You visual rendering is compile-checked and manual-only |
 | System | safe/auto heap math, battery/notification state helpers |
 | Misc | log rotation/tail, heap-sampler parsing, generic TCP connection counter, EULA text |
 
@@ -38,7 +39,10 @@ Android-framework-dependent classes (foreground service, notifications,
 wakelocks, intents, `ActivityManager`) are covered by compile checks and the
 manual checklist below — not by Robolectric/instrumentation in this build. The
 foreground service's start/stop/restart decisions are additionally covered by
-the pure-JVM `ServiceLifecycleDecisionsTest`.
+the pure-JVM `ServiceLifecycleDecisionsTest` (9 tests) and the theme palette
+values by `ThemePalettesTest` (17 tests). The port-conflict rules and
+`portOwner` live in the Android-dependent `ServerManager` and are
+review-verified, not unit-tested.
 
 ## Host-level integration validation
 
@@ -59,7 +63,7 @@ Android app sandbox, foreground service or Doze.
 | Modrinth API live smoke | ✅ search `worldedit` plugins for 1.20.4/paper returned hits; project versions returned a primary `.jar` (16 KB, SHA-1 present); file HEAD → HTTP 200. UA/facets/encoding validated manually; not part of the hermetic suite |
 | Termux mirror smoke (live) | ✅ `Packages.gz` 732 KB → parsed 3,029 packages; real `openjdk-21` deb chain downloaded with SHA-256 verification and extracted to a runnable JRE |
 | Mirror speed probe (host/dev network) | ✅ TUNA ~2.9 MB/s, MWT ~2.5 MB/s, Grimler ~1.4 MB/s, USTC ~0.7 MB/s, BFSU ~0.4 MB/s on a 3 MB range request; auto-probe ordering is unit-tested without network |
-| Full Gradle unit suite | ✅ 424 tests, 0 failures, 0 errors, 3 skipped (exact count in the v1.4.1 release) |
+| Full Gradle unit suite | ✅ 448 tests, 0 failures, 0 errors, 3 skipped (exact count in the v1.5.0 release) |
 
 ### LAN smoke check (JVM)
 
@@ -124,7 +128,7 @@ classes (no Android device and no Geyser install needed):
    6e).
 
 Results for a release are recorded with that release's artifacts (see the
-v1.4.1 release).
+v1.5.0 release).
 
 Known host-level quirks observed:
 
@@ -213,6 +217,30 @@ Not executed in this build environment (no device or emulator attached).
    and confirm it reappears in the list immediately. When the running server is
    the only instance, the list area must show the “shown in the panel above”
    hint instead of the “No servers yet” empty state.
+6i. **Multi-server hosting** — start two or three servers with different ports:
+   each must have its own console/status and keep running independently. Home
+   must show one active-server panel per running server, with running servers
+   removed from the “Servers” list and an “N running / 5” count; tapping an
+   active-server card focuses that server and opens its details, and opening a
+   console focuses the right instance. The
+   notification must show the focused server plus “N servers running”. Stop one
+   server from the notification/screen: only that one stops; restart one; then
+   **Stop all** and confirm the notification clears with no JVM left. Check
+   Device RAM, heat and battery with three servers running, then stop them.
+6j. **Port-conflict guard & 5-server limit** — create/edit a server with a port
+   already configured on another instance: the create screen and the port fields
+   must warn (naming the owner) without blocking the save. Start it anyway: the
+   start must be rejected with the owner named. Change `server-port` (Minecraft)
+   or the generic port to a free value and start successfully. Start five
+   servers, then try a sixth: it must be rejected with the limit message. With
+   two Minecraft+Geyser servers running, confirm only the first gets the Bedrock
+   bridge and the later one is warned.
+6k. **Theme picker** — open Settings → Appearance and cycle all nine choices
+   (System, Light, Dark, Material You, Monochromatic Blue, Energy, Triadic,
+   Analog Green, High Contrast Black): each must apply immediately, have a usable
+   light and dark variant, and keep the active-server card/`RUNNING` pill in the
+   theme accent. On Android 12+ confirm Material You uses dynamic colours; on
+   older versions confirm it falls back to System. Return to System.
 7. **Screen off** — start a server, turn the screen off for 15+ minutes, confirm
    the process stays alive and the console keeps flowing.
 7. **Doze** — leave the device idle/unplugged for 30+ minutes with the
@@ -248,7 +276,11 @@ Not executed in this build environment (no device or emulator attached).
   logic, but real broadcast/client listing, the NetherNet direct path and whether
   Geyser's NetherNet native library loads on the phone are manual-only (checklist
   item 6e).
-- The real service Stop → Start / Restart transitions, stop timings, light/dark
-  theme contrast and the Home screen de-duplication can only be verified on a
-  device; the hermetic `ServiceLifecycleDecisionsTest` covers the lifecycle
-  decision logic and the rest is checklist items 6f–6h.
+- The real service Stop → Start / Restart transitions, stop timings, multi-server
+  concurrency (up to 5 JVMs, focus switching, per-instance crash/auto-restart),
+  theme contrast, Material You dynamic colour and the Home screen
+  de-duplication can only be verified on a device; `ServiceLifecycleDecisionsTest`
+  and `ThemePalettesTest` cover the pure logic and the rest is checklist items
+  6f–6k.
+- The Bedrock bridge's single-owner rule with several concurrent sessions needs a
+  real device/access point and a Geyser setup (manual checklist item 6j).

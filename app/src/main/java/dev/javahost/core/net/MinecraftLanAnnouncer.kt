@@ -49,6 +49,10 @@ class MinecraftLanAnnouncer(
     private var scope: CoroutineScope? = null
     private var socket: MulticastSocket? = null
     private var running = false
+
+    /** True only when THIS announcer holds a reference to the shared multicast lock. */
+    private var lockHeld = false
+
     private var lastErrorAtNs: Long? = null
 
     /**
@@ -91,11 +95,16 @@ class MinecraftLanAnnouncer(
             val multicastSocket = try {
                 openSocket()
             } catch (t: Throwable) {
-                runCatching { lan.releaseMulticastLock() }
+                // Only release a reference this announcer actually acquired: the
+                // lock is now reference-counted and shared with other sessions.
+                if (multicastLock) {
+                    runCatching { lan.releaseMulticastLock() }
+                }
                 reportError("Cannot announce the server on the LAN: ${describe(t)}")
                 return false
             }
 
+            lockHeld = multicastLock
             val newScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
             socket = multicastSocket
             scope = newScope
@@ -111,17 +120,20 @@ class MinecraftLanAnnouncer(
      * negligible (the socket close is non-blocking).
      */
     fun stop() {
-        val (scopeToCancel, socketToClose) = synchronized(stateLock) {
+        val (scopeToCancel, socketToClose, releaseLock) = synchronized(stateLock) {
             val currentScope = scope
             val currentSocket = socket
+            val held = lockHeld
             running = false
+            lockHeld = false
             scope = null
             socket = null
-            currentScope to currentSocket
+            Triple(currentScope, currentSocket, held)
         }
         runCatching { scopeToCancel?.cancel() }
         socketToClose?.let { multicast -> runCatching { multicast.close() } }
-        runCatching { lan.releaseMulticastLock() }
+        // Reference-counted: only the session that acquired it may release it.
+        if (releaseLock) runCatching { lan.releaseMulticastLock() }
     }
 
     /** True between a successful [start] and the next [stop]. */
