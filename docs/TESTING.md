@@ -12,10 +12,10 @@ Run:
 ./gradlew :app:testDebugUnitTest
 ```
 
-Final run in this environment for the 1.4.0 suite: **424 hermetic tests,
-0 failures, 0 errors, 3 skipped** (419 before this release; the skipped tests are
-environment-gated real-archive/real-JRE smoke tests that only run when their
-fixture variables are provided).
+Final run in this environment for the 1.4.1 suite: **424 hermetic tests,
+0 failures, 0 errors, 3 skipped** (no new tests in this UI-only release; 419
+before 1.4.0; the skipped tests are environment-gated real-archive/real-JRE
+smoke tests that only run when their fixture variables are provided).
 
 Coverage by area:
 
@@ -59,7 +59,7 @@ Android app sandbox, foreground service or Doze.
 | Modrinth API live smoke | ✅ search `worldedit` plugins for 1.20.4/paper returned hits; project versions returned a primary `.jar` (16 KB, SHA-1 present); file HEAD → HTTP 200. UA/facets/encoding validated manually; not part of the hermetic suite |
 | Termux mirror smoke (live) | ✅ `Packages.gz` 732 KB → parsed 3,029 packages; real `openjdk-21` deb chain downloaded with SHA-256 verification and extracted to a runnable JRE |
 | Mirror speed probe (host/dev network) | ✅ TUNA ~2.9 MB/s, MWT ~2.5 MB/s, Grimler ~1.4 MB/s, USTC ~0.7 MB/s, BFSU ~0.4 MB/s on a 3 MB range request; auto-probe ordering is unit-tested without network |
-| Full Gradle unit suite | ✅ 424 tests, 0 failures, 0 errors, 3 skipped (exact count in the v1.4.0 release) |
+| Full Gradle unit suite | ✅ 424 tests, 0 failures, 0 errors, 3 skipped (exact count in the v1.4.1 release) |
 
 ### LAN smoke check (JVM)
 
@@ -124,7 +124,7 @@ classes (no Android device and no Geyser install needed):
    6e).
 
 Results for a release are recorded with that release's artifacts (see the
-v1.4.0 release).
+v1.4.1 release).
 
 Known host-level quirks observed:
 
@@ -208,6 +208,11 @@ Not executed in this build environment (no device or emulator attached).
    properties editor) must stay readable with dark text on cream. Switch to dark
    mode and confirm the previous ink/teal theme is unchanged. Keep screenshots
    for the release notes.
+6h. **Home screen de-duplication** — start a server: it must appear only in the
+   top active-server panel, not duplicated in the “Servers” list below; stop it
+   and confirm it reappears in the list immediately. When the running server is
+   the only instance, the list area must show the “shown in the panel above”
+   hint instead of the “No servers yet” empty state.
 7. **Screen off** — start a server, turn the screen off for 15+ minutes, confirm
    the process stays alive and the console keeps flowing.
 7. **Doze** — leave the device idle/unplugged for 30+ minutes with the
@@ -243,7 +248,7 @@ Not executed in this build environment (no device or emulator attached).
   logic, but real broadcast/client listing, the NetherNet direct path and whether
   Geyser's NetherNet native library loads on the phone are manual-only (checklist
   item 6e).
-- The real service Stop → Start / Restart transitions, stop timings and
-  light/dark theme contrast can only be verified on a device; the hermetic
-  `ServiceLifecycleDecisionsTest` covers the decision logic and the rest is
-  checklist items 6f–6g.
+- The real service Stop → Start / Restart transitions, stop timings, light/dark
+  theme contrast and the Home screen de-duplication can only be verified on a
+  device; the hermetic `ServiceLifecycleDecisionsTest` covers the lifecycle
+  decision logic and the rest is checklist items 6f–6h.

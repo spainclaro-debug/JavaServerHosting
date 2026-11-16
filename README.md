@@ -11,8 +11,9 @@ no root**. The APK is intended for GitHub/F-Droid-style sideloading; see
 
 > **Status:** functional MVP, buildable and tested. **424 hermetic unit tests
 > (0 failures, 3 environment-gated skips)**; debug and signed release APKs
-> are built. The current release is **1.4.0** (versionCode 11, reliable
-> stop/start/restart + light theme); see [CHANGELOG.md](CHANGELOG.md). Minecraft
+> are built. The current release is **1.4.1** (versionCode 12, Home-screen
+> cleanup + reliable stop/start/restart + light theme); see
+> [CHANGELOG.md](CHANGELOG.md). Minecraft
 > (Vanilla 1.20.4, Paper 1.20.4, Fabric 1.20.4), a generic Java server (WireMock)
 > and a purpose-built sample HTTP server were booted on an Android/bionic
 > OpenJDK 21 during development.
@@ -311,11 +312,12 @@ versions even though the server runs.
 - Server visible in Minecraft but join fails
 
 See [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md) for the server-flavor /
-loader matrix, the LAN card and join checklists. JavaHost 1.4.0 makes Stop →
-Start work without closing the app (revivable manager, queued start, one-operation
-restart, bounded stop) and adds the light theme; 1.3.0 added the Bedrock LAN
-bridge on top of the 1.2.0 LAN work. v1.4.0 is an **in-place upgrade of 1.3.0**
-(same signing key), so settings, instances and worlds are kept.
+loader matrix, the LAN card and join checklists. JavaHost 1.4.1 removes the
+duplicate Home-screen entry for the running server; 1.4.0 makes Stop → Start work
+without closing the app (revivable manager, queued start, one-operation restart,
+bounded stop) and adds the light theme; 1.3.0 added the Bedrock LAN bridge on top
+of the 1.2.0 LAN work. v1.4.1 is an **in-place upgrade of 1.4.0** (same signing
+key), so settings, instances and worlds are kept.
 
 ## Project layout
 

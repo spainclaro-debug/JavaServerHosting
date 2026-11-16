@@ -110,7 +110,10 @@ fun HomeScreen(
 ) {
     val crash = state.lastCrash
     val crashInstance = state.instance(state.activeInstanceId ?: state.settings.lastActiveInstanceId)
-    val active = state.activeInstance
+    // The server shown in the top panel. While it is active it must not also appear in
+    // the "Servers" list below; it returns to the list as soon as it stops.
+    val activePanel = state.activeInstance?.takeIf { state.runtime.isActive }
+    val listedInstances = state.instances.filterNot { it.id == activePanel?.id }
     val statusColors = javaHostStatusColors()
 
     Scaffold(
@@ -199,13 +202,13 @@ fun HomeScreen(
                 }
             }
 
-            if (active != null && state.runtime.isActive) {
+            if (activePanel != null) {
                 item {
                     ActiveServerCard(
                         state = state,
-                        instance = active,
-                        onOpenConsole = { onOpenConsole(active.id) },
-                        onOpenDetails = { onOpenInstance(active.id) },
+                        instance = activePanel,
+                        onOpenConsole = { onOpenConsole(activePanel.id) },
+                        onOpenDetails = { onOpenInstance(activePanel.id) },
                         actions = actions
                     )
                 }
@@ -214,7 +217,7 @@ fun HomeScreen(
             item {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text(
-                        if (state.instances.isEmpty()) "Servers" else "Servers (${state.instances.size})",
+                        if (listedInstances.isEmpty()) "Servers" else "Servers (${listedInstances.size})",
                         style = MaterialTheme.typography.titleMedium,
                         modifier = Modifier.weight(1f)
                     )
@@ -224,8 +227,8 @@ fun HomeScreen(
                 }
             }
 
-            if (state.instances.isEmpty()) {
-                item {
+            when {
+                state.instances.isEmpty() -> item {
                     EmptyState(
                         title = "No servers yet",
                         body = "Pick a server .jar you already have — Minecraft server JARs are first-class, " +
@@ -235,8 +238,14 @@ fun HomeScreen(
                         onAction = onCreate
                     )
                 }
-            } else {
-                items(state.instances, key = { it.id }) { instance ->
+                listedInstances.isEmpty() -> item {
+                    Text(
+                        "The running server is shown in the panel above. It returns to this list when stopped.",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+                else -> items(listedInstances, key = { it.id }) { instance ->
                     InstanceCard(
                         state = state,
                         instance = instance,

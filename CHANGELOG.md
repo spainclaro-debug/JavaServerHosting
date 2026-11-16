@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.4.1 — 2026-11-16
+
+- **The running server is no longer duplicated on Home.** While a server is
+  active it appears only in the top “active server” panel; the “Servers” list
+  below now hides it and shows it again as soon as it stops. When the active
+  server is the only instance, the list area shows a short hint (“The running
+  server is shown in the panel above…”) instead of the “No servers yet” empty
+  state.
+- UI-only cleanup: no changes to hosting, stop/start, LAN or Bedrock behaviour.
+- 424 hermetic unit tests (no new tests; UI-only change).
+- **Release note:** the 1.4.1 APK is signed with the same development key as
+  1.4.0, so it installs as an **in-place upgrade**; instances, worlds, plugins and
+  settings are preserved.
+
 ## 1.4.0 — 2026-11-16
 
 Fixes the “after Stop, Start does nothing until the app is closed” bug and adds
