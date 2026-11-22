@@ -260,6 +260,35 @@ It also reads the highest class-file major version (→ minimum Java 17/21/25),
 records the evidence lines shown in the UI. The user can always override the
 classification manually; detection is a convenience, not a gate.
 
+### Server JAR update (1.6.0)
+
+The server screen's **Server JAR** card can replace an instance's JAR without
+recreating the instance. The UI launches the system picker
+(`ActivityResultContracts.OpenDocument`), then `AppViewModel.updateJar(id, uri)`
+refuses while that instance has a running session, persists the read permission,
+copies the picked URI into a temp file under the app's downloads cache and calls
+`JarUpdater.update(instanceDir, instance.jarFile, tempJar)` on IO; the temp file
+is deleted in `finally`. On success the instance metadata is updated from the new
+`JarInspection` (kind, flavor, Minecraft version, crash summary cleared) — the JAR
+file name and `jreMajor` are not changed — and the message names the `.bak` copy
+and warns when `suggestedJreMajor` is newer than the instance's Java. The user
+restarts the server to boot the new JAR.
+
+`JarUpdater` is Android-free and hermetically unit-tested. It validates that the
+source exists, the target is a simple file name inside the instance directory and
+the source is not the target; **inspects before touching anything** (an
+`InspectionResult.Failure` or a `needsInstaller` JAR aborts the update); copies
+the source to a `.jarupdate-*.tmp` in the instance directory; **copies** the
+existing target to `<jarFileName>.bak` (replacing an older backup, so there is
+exactly one rollback generation) — the backup exists before the swap — then moves
+the temp file over the target with `Files.move(..., ATOMIC_MOVE)`. The target
+therefore always exists through a crash: it is the old JAR before the atomic
+move and the new one after it, and if the app is killed mid-update the old JAR is
+still restored from the backup copy on the next update. Errors restore the backup
+and delete the temp file; stale `.jarupdate-*.tmp` files are cleaned up on the
+next update. No other file in the instance directory is touched (world,
+`plugins/`/`mods/`, `server.properties`, logs).
+
 ## Server lifecycle
 
 `ServerManager` hosts up to five concurrent sessions and each instance follows

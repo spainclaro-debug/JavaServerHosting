@@ -1,5 +1,13 @@
 # Troubleshooting
 
+## Upgrading from 1.5.0
+
+The JavaHost 1.6.0 APK is signed with the same development key as 1.5.0 and
+installs as an **in-place upgrade**: instances, worlds, plugins, settings, the
+installed JRE and the chosen theme are kept. There is nothing to migrate — the
+new **Update JAR file** action only appears on each server screen, and existing
+servers keep their JARs until you choose to replace one.
+
 ## Upgrading from 1.4.1
 
 The JavaHost 1.5.0 APK is signed with the same development key as 1.4.1 and
@@ -391,6 +399,48 @@ path keeps working when only broadcasts are filtered.
 Some Spring Boot fat JARs (for example **Suwayomi**) contain duplicate `LICENSE`
 entries. 1.1.5 retries with a tolerant ZIP reader and imports them as generic
 servers. If you are on an older build, update JavaHost.
+
+## “Updating a server's JAR”
+
+JavaHost 1.6.0 can replace an existing server's JAR without recreating the
+instance or touching the world:
+
+1. Open the server → **Server JAR** card → **Update JAR file** and pick the new
+   `.jar` with the system file picker.
+2. **Stop the server first.** The button is disabled and the action refused while
+   that server is running (“Stop the server before updating its JAR file.”).
+   Other running servers are unaffected.
+3. The update replaces only the server JAR. The world, `plugins/`/`mods/`,
+   `server.properties`, logs and every other file in the instance directory stay
+   in place.
+4. The **previous JAR is kept as `<jarFileName>.bak`** next to the new one — one
+   rollback generation (a later update replaces that backup). JavaHost has no
+   one-click rollback: to go back, stop the server, open the instance's Files,
+   rename the current `.jar` aside and rename the `.bak` to the original JAR
+   name (or re-pick the old file with **Update JAR file**).
+5. The new JAR is inspected immediately and the server type/Minecraft version in
+   the app is updated. If it recommends a **newer Java** than the instance uses,
+   the success message warns you: install/switch that Java in **Java runtimes**
+   (or use a build that matches the current Java) before starting, otherwise the
+   server fails with an unsupported-class-version error.
+6. **Restart the server** to boot the new JAR.
+
+If the update is **rejected** (“Could not update the server JAR: …”), the old
+JAR is untouched and no temp files are left behind. Common reasons: the picked
+file is not a valid/corrupt JAR, it is a Forge/Fabric **installer** JAR (import
+the installed server JAR instead), or the file could not be read. A failed
+copy/rename is rolled back to the previous JAR automatically.
+
+The replace is **rollback-safe rather than merely atomic**: the previous JAR is
+kept as `<jar>.bak` and the new JAR is moved into place with an atomic move
+after the backup copy, so the instance always has a JAR. If the app is **killed
+mid-update**, the old JAR is still restored from the backup copy on the next
+update, and stale `.jarupdate-*.tmp` files are cleaned up then.
+
+If the server no longer behaves after a successful update, check the console:
+a JAR for a different server type (for example moving from Paper to Vanilla)
+will ignore `plugins/`; move the world/plugins if intended, or roll back to the
+`.bak`. Worlds, plugins and settings are never deleted by the update itself.
 
 ## “Stop is stuck / I had to force-stop the app”
 

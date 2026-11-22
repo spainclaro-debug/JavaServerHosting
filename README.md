@@ -9,11 +9,10 @@ Built with Kotlin + Jetpack Compose. Target: **arm64-v8a, Android 8.0+ (API 26),
 no root**. The APK is intended for GitHub/F-Droid-style sideloading; see
 [Why targetSdk 28](docs/ARCHITECTURE.md#why-the-app-targets-api-28).
 
-> **Status:** functional MVP, buildable and tested. **448 hermetic unit tests
+> **Status:** functional MVP, buildable and tested. **470 hermetic unit tests
 > (0 failures, 3 environment-gated skips)**; debug and signed release APKs
-> are built. The current release is **1.5.0** (versionCode 13, up to 5 servers
-> at once, port-conflict guard and theme picker); see
-> [CHANGELOG.md](CHANGELOG.md). Minecraft
+> are built. The current release is **1.6.0** (versionCode 14, in-place
+> “Update JAR file”); see [CHANGELOG.md](CHANGELOG.md). Minecraft
 > (Vanilla 1.20.4, Paper 1.20.4, Fabric 1.20.4), a generic Java server (WireMock)
 > and a purpose-built sample HTTP server were booted on an Android/bionic
 > OpenJDK 21 during development.
@@ -81,6 +80,12 @@ no root**. The APK is intended for GitHub/F-Droid-style sideloading; see
   `eula.txt` and blocks start until accepted.
 - Player count parsed from server output and shown in the notification/UI.
 - Server readiness detection and crash diagnostics.
+- **Update the server JAR in place:** on the server screen pick a new `.jar`
+  with the system file picker — the world, `plugins/`/`mods/`,
+  `server.properties`, logs and every other file are kept; the previous JAR is
+  kept as `<jar>.bak` for rollback; the new JAR is re-detected (type/flavor,
+  Minecraft version) and a newer-Java recommendation is flagged. The update is
+  blocked while that server runs — restart to apply the new JAR.
 - **Bedrock Edition clients** through Geyser-Spigot + Floodgate and the app's
   Bedrock LAN bridge (see LAN features below); Java and Bedrock can both be
   hosted and discovered at the same time.
@@ -252,7 +257,7 @@ exemption → Phantom Process Killer guidance → optional Minecraft EULA → do
 
 ```bash
 # JDK 17+ and Android SDK 34 required.
-./gradlew :app:testDebugUnitTest   # 448 hermetic tests
+./gradlew :app:testDebugUnitTest   # 470 hermetic tests
 ./gradlew :app:assembleDebug       # app/build/outputs/apk/debug/app-debug.apk
 ./gradlew :app:assembleRelease     # unsigned; sign with apksigner for distribution
 ```
@@ -351,6 +356,7 @@ some server versions even though the server runs.
 
 - I can't start a second server / “port already in use”
 - Only some of my servers run at once (5-server limit / memory)
+- Updating a server's JAR (rollback, Java warning, restart)
 - Stop → Start did nothing until the app was restarted (fixed in 1.4.0)
 - Stop still stuck / server will not die
 - Themes look wrong / Material You falls back to System
@@ -360,11 +366,12 @@ some server versions even though the server runs.
 - Server visible in Minecraft but join fails
 
 See [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md) for the server-flavor /
-loader matrix, port-conflict, multi-server, theme and join checklists. JavaHost
-1.5.0 adds up to 5 concurrent servers, the port-conflict guard and the theme
-picker; 1.4.0 made Stop → Start work without closing the app and added the light
-theme; 1.3.0 added the Bedrock LAN bridge. v1.5.0 is an **in-place upgrade of
-1.4.1** (same signing key), so settings, instances and worlds are kept.
+loader matrix, port-conflict, multi-server, theme, JAR-update and join checklists.
+JavaHost 1.6.0 adds in-place server JAR updates; 1.5.0 added up to 5 concurrent
+servers, the port-conflict guard and the theme picker; 1.4.0 made Stop → Start
+work without closing the app and added the light theme; 1.3.0 added the Bedrock
+LAN bridge. v1.6.0 is an **in-place upgrade of 1.5.0** (same signing key), so
+settings, instances and worlds are kept.
 
 ## Project layout
 

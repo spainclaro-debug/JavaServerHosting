@@ -12,8 +12,8 @@ Run:
 ./gradlew :app:testDebugUnitTest
 ```
 
-Final run in this environment for the 1.5.0 suite: **448 hermetic tests,
-0 failures, 0 errors, 3 skipped** (424 before this release; the skipped tests are
+Final run in this environment for the 1.6.0 suite: **470 hermetic tests,
+0 failures, 0 errors, 3 skipped** (448 before this release; the skipped tests are
 environment-gated real-archive/real-JRE smoke tests that only run when their
 fixture variables are provided).
 
@@ -31,7 +31,8 @@ Coverage by area:
 | Bedrock (new in 1.3.0) | `core/net/BedrockRakNetTest` — ping detection/build, pong parse/build, MAGIC and length checks, `MCPE;…` server-id parse/build round-trips with missing ports and unknown trailing fields, pong rewrite (port/GUID, echoed ping time preserved) invalid-input safety; `core/net/BedrockLanRelayTest` — loopback UDP harness: client ping bytes forwarded unchanged and the reply pong rewritten with the advertised port + relay GUID, non-ping datagrams relayed both ways through a mock upstream socket, two clients isolated, busy port (no `SO_REUSEADDR`) makes `start()` return false, a non-positive beacon interval sends no unsolicited pong bytes, idle/stop cleanup; `core/net/BedrockGeyserConfigTest` — config discovery, modern `bedrock:`/`port:` and legacy `bedrock-port:` patching, `prepareForBridge` transport/WebRTC cases (`transport` absent → no-op, `nethernet` → `both`, `webrtc-port 0` → `19134`, idempotent), comments/CRLF/indentation preserved, port-only restore happy/no-op, atomic write |
 | Service lifecycle (new in 1.4.0) | `core/service/ServiceLifecycleDecisionsTest` (9 tests) — truth table for `decideStart` (`ADOPT_RUNNING`, `QUEUE_AFTER_STOP`, `CLEAR_STALE_THEN_START`, `START_FRESH`) and `decideRestart` (`RESTART_EXISTING`, `CLEAR_STALE_THEN_START`, `START_FRESH`) over active/stopping/idle runtime states with and without a real session; verifies the stale-runtime and start-during-stop cases that caused the 1.3.0 bug. `ServerManager`'s fast-stop constants/escalation are review-verified; real service timing is manual-only |
 | Multi-server & port guard (new in 1.5.0) | no hermetic tests for the port rules: the resolved-port rules (Minecraft `server.properties` → instance port → 25565; generic instance port), `portOwner(port, except)` and the start rejections (already active, five-session limit, port conflict naming the owner) live in the Android-dependent `ServerManager` and are **review-verified** plus covered by the manual checklist. The per-instance lifecycle decision helper (`ServiceLifecycleDecisionsTest`, 9 tests) is the unit-tested part; real concurrent-JVM behaviour and per-instance notification/auto-restart are manual-only |
-| Themes (1.4.0 → 1.5.0) | `core/model/ThemePalettesTest` (17 tests) — exact ARGB hex values for every custom palette (Monochromatic Blue, Energy, Triadic, Analog Green, High Contrast Black) in light and dark variants, `null` for `SYSTEM`/`MATERIAL_YOU`, all `ThemeChoice` values covered, plus any extracted on-colour/contrast helper cases. `ThemeCatalog`/Material You visual rendering is compile-checked and manual-only |
+| Themes (1.4.0 → 1.5.0) | `core/model/ThemePalettesTest` (20 tests) — exact ARGB hex values for every custom palette (Monochromatic Blue, Energy, Triadic, Analog Green, High Contrast Black) in light and dark variants, `null` for `SYSTEM`/`MATERIAL_YOU`, all `ThemeChoice` values covered, plus the on-colour/contrast helper cases (including the v1.5.0 contrast fix). `ThemeCatalog`/Material You visual rendering is compile-checked and manual-only |
+| JAR update (new in 1.6.0) | `core/storage/JarUpdaterTest` (hermetic, `TemporaryFolder`) — replaces the target JAR content and creates `<jar>.bak` with the old bytes; other files untouched; a second update replaces the single `.bak` (no growing files); missing source; target path traversal (`../x.jar`, `/abs.jar`, `.`, `..`) rejected; inspection failure leaves the target unchanged and cleans temp files; installer JAR rejected; same-file rejected; a failure rolls back with the target intact; temp files cleaned, including stale `.jarupdate-*.tmp` files from a killed update. The backup-copy + `ATOMIC_MOVE` crash-safety (the target always exists through a crash) is review-verified; the UI running-guard and SAF flow are compile-checked and manual-only |
 | System | safe/auto heap math, battery/notification state helpers |
 | Misc | log rotation/tail, heap-sampler parsing, generic TCP connection counter, EULA text |
 
@@ -40,7 +41,7 @@ wakelocks, intents, `ActivityManager`) are covered by compile checks and the
 manual checklist below — not by Robolectric/instrumentation in this build. The
 foreground service's start/stop/restart decisions are additionally covered by
 the pure-JVM `ServiceLifecycleDecisionsTest` (9 tests) and the theme palette
-values by `ThemePalettesTest` (17 tests). The port-conflict rules and
+values by `ThemePalettesTest` (20 tests). The port-conflict rules and
 `portOwner` live in the Android-dependent `ServerManager` and are
 review-verified, not unit-tested.
 
@@ -63,7 +64,7 @@ Android app sandbox, foreground service or Doze.
 | Modrinth API live smoke | ✅ search `worldedit` plugins for 1.20.4/paper returned hits; project versions returned a primary `.jar` (16 KB, SHA-1 present); file HEAD → HTTP 200. UA/facets/encoding validated manually; not part of the hermetic suite |
 | Termux mirror smoke (live) | ✅ `Packages.gz` 732 KB → parsed 3,029 packages; real `openjdk-21` deb chain downloaded with SHA-256 verification and extracted to a runnable JRE |
 | Mirror speed probe (host/dev network) | ✅ TUNA ~2.9 MB/s, MWT ~2.5 MB/s, Grimler ~1.4 MB/s, USTC ~0.7 MB/s, BFSU ~0.4 MB/s on a 3 MB range request; auto-probe ordering is unit-tested without network |
-| Full Gradle unit suite | ✅ 448 tests, 0 failures, 0 errors, 3 skipped (exact count in the v1.5.0 release) |
+| Full Gradle unit suite | ✅ 470 tests, 0 failures, 0 errors, 3 skipped (exact count in the v1.6.0 release) |
 
 ### LAN smoke check (JVM)
 
@@ -128,7 +129,7 @@ classes (no Android device and no Geyser install needed):
    6e).
 
 Results for a release are recorded with that release's artifacts (see the
-v1.5.0 release).
+v1.6.0 release).
 
 Known host-level quirks observed:
 
@@ -241,6 +242,17 @@ Not executed in this build environment (no device or emulator attached).
    light and dark variant, and keep the active-server card/`RUNNING` pill in the
    theme accent. On Android 12+ confirm Material You uses dynamic colours; on
    older versions confirm it falls back to System. Return to System.
+6l. **Update JAR file** — on a stopped server with a world/plugins, tap
+   **Update JAR file** on the **Server JAR** card and pick a different valid
+   server `.jar` via the system picker: the JAR must be replaced in place, a
+   `<jar>.bak` with the previous bytes created, and the world, `plugins/`,
+   `server.properties` and logs left intact; the app shows the updated
+   type/Minecraft version and a Java warning if one is recommended. Start the
+   server and confirm the new JAR boots and the world is intact; then try the
+   update while the server is running (button disabled / refused). Reject cases:
+   pick an invalid file or a Forge/Fabric installer JAR — the old JAR must stay
+   and no `.bak`/temp garbage is left. Restore the rollback by renaming the
+   `.bak` over the JAR in Files and confirm the old version boots again.
 7. **Screen off** — start a server, turn the screen off for 15+ minutes, confirm
    the process stays alive and the console keeps flowing.
 7. **Doze** — leave the device idle/unplugged for 30+ minutes with the
@@ -278,9 +290,10 @@ Not executed in this build environment (no device or emulator attached).
   item 6e).
 - The real service Stop → Start / Restart transitions, stop timings, multi-server
   concurrency (up to 5 JVMs, focus switching, per-instance crash/auto-restart),
-  theme contrast, Material You dynamic colour and the Home screen
-  de-duplication can only be verified on a device; `ServiceLifecycleDecisionsTest`
-  and `ThemePalettesTest` cover the pure logic and the rest is checklist items
-  6f–6k.
+  theme contrast, Material You dynamic colour, the Home screen de-duplication and
+  the SAF-based JAR-update flow can only be verified on a device;
+  `ServiceLifecycleDecisionsTest` and `ThemePalettesTest` cover the pure logic,
+  `JarUpdaterTest` covers the file replace/rollback logic, and the rest is
+  checklist items 6f–6l.
 - The Bedrock bridge's single-owner rule with several concurrent sessions needs a
   real device/access point and a Geyser setup (manual checklist item 6j).

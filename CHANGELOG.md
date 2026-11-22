@@ -1,5 +1,44 @@
 # Changelog
 
+## 1.6.0 — 2026-11-22
+
+Adds **Update JAR file** on the server screen: replace a server's JAR in place
+without recreating the instance or touching its world.
+
+### Update JAR file
+- The server screen (edit/details) now has a **Server JAR** card with an
+  **Update JAR file** button that opens the system file picker
+  (`ActivityResultContracts.OpenDocument`). Pick a new server `.jar` and JavaHost
+  replaces the instance's server JAR **in place**.
+- **Everything else is kept:** the world, `plugins/`/`mods/`,
+  `server.properties`, logs and every other file in the instance directory stay
+  untouched; only the server JAR is replaced.
+- **Single rollback copy:** the previous JAR is kept next to the new one as
+  `<jarFileName>.bak`. A later update replaces that backup, so there is always
+  exactly one previous generation.
+- **Re-detected immediately:** the new JAR is inspected again (server
+  type/flavor, Minecraft version, suggested Java). The instance metadata is
+  updated and — if the new JAR recommends a newer Java major than the instance
+  uses — the success message adds a warning to install/switch Java before
+  starting.
+- **Blocked while running:** the button is disabled and the action refused while
+  that server is running (“Stop the server before updating its JAR file.”).
+  **Restart** the server afterwards to boot the new JAR.
+- **Rollback-safe:** updates are rejected for missing files, invalid/corrupt
+  JARs, Forge/Fabric installer JARs, odd target names and same-file picks, and an
+  error leaves the old JAR intact. The previous JAR is kept as
+  `<jarFileName>.bak`, and the new JAR is moved into place with `ATOMIC_MOVE`
+  after that backup copy, so the target always exists through a crash; if the app
+  is killed mid-update the old JAR is still restored from the backup copy, and
+  stale `.jarupdate-*.tmp` files are cleaned up on the next update.
+
+- 470 hermetic unit tests (new `JarUpdaterTest`: in-place replace, `.bak`
+  handling, path/same-file/installer/invalid-JAR rejections and failure
+  rollback; exact count in the release build).
+- **Release note:** the 1.6.0 APK is signed with the same development key as
+  1.5.0, so it installs as an **in-place upgrade**; instances, worlds, plugins,
+  settings and the installed JRE are preserved.
+
 ## 1.5.0 — 2026-11-16
 
 Adds **multi-server hosting (up to five JVMs at once)**, a **port-conflict

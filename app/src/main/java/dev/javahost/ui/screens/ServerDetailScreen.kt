@@ -1,5 +1,7 @@
 package dev.javahost.ui.screens
 
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -115,6 +117,11 @@ fun ServerDetailScreen(
     var showDelete by remember { mutableStateOf(false) }
     var showRename by remember { mutableStateOf(false) }
     var showForceStop by remember { mutableStateOf(false) }
+
+    // SAF picker for "Update JAR file"; the ViewModel replaces the file in place.
+    val jarPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null) actions.updateJar(live.id, uri)
+    }
 
     val safeMaxMb = maxOf(512, (state.device.safeMaxHeapMb / 128) * 128)
     val autoHeapMb = state.device.autoHeapMb.coerceIn(256, safeMaxMb)
@@ -560,6 +567,38 @@ fun ServerDetailScreen(
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
+            }
+
+            /* ---------------- Server JAR ---------------- */
+            SectionCard(
+                title = "Server JAR",
+                subtitle = "Replace the server file in place"
+            ) {
+                InfoRow("Current JAR", live.jarFile)
+                InfoRow("Detected type", mainFlavorLabel(live.flavor))
+                InfoRow("Java runtime", "Java ${live.jreMajor}")
+                Text(
+                    "Replace only the server JAR. Worlds, plugins/mods, settings and logs stay in " +
+                        "place; the previous JAR is kept as ${live.jarFile}.bak.",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                if (isThisActive) {
+                    Text(
+                        "Stop the server before updating its JAR.",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = statusColors.warning
+                    )
+                }
+                OutlinedButton(
+                    onClick = {
+                        jarPicker.launch(
+                            arrayOf("application/java-archive", "application/zip", "*/*")
+                        )
+                    },
+                    enabled = !isThisActive,
+                    modifier = Modifier.fillMaxWidth()
+                ) { Text("Update JAR file") }
             }
 
             /* ---------------- Danger zone ---------------- */

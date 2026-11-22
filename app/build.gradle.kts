@@ -17,8 +17,8 @@ android {
         // See gradle.properties: API 28 is intentional so the downloaded JRE can
         // be exec()'d from app-private storage on Android 10+ (W^X).
         targetSdk = targetSdkOverride
-        versionCode = 13
-        versionName = "1.5.0"
+        versionCode = 14
+        versionName = "1.6.0"
 
         vectorDrawables { useSupportLibrary = true }
 

@@ -34,6 +34,8 @@ import dev.javahost.core.model.ThemeChoice
 import dev.javahost.core.model.UiMessage
 import dev.javahost.core.net.BedrockGeyserConfig
 import dev.javahost.core.service.ForegroundServerService
+import dev.javahost.core.storage.JarUpdateResult
+import dev.javahost.core.storage.JarUpdater
 import dev.javahost.core.storage.SafePaths
 import dev.javahost.core.storage.ServerPropertiesCodec
 import dev.javahost.core.system.MemoryAdvisor
@@ -580,6 +582,95 @@ class AppViewModel(application: Application) : AndroidViewModel(application), Ap
             return
         }
         container.instances.update(id) { it.copy(name = trimmed) }
+    }
+
+    /**
+     * Replaces the instance's server JAR in place (world/plugins/settings/logs kept,
+     * previous JAR kept as `<jar>.bak`) and re-detects kind/flavor/Minecraft version.
+     * Refused while that server has a running session; the manager would not let a
+     * new JAR take effect until restart anyway.
+     */
+    override fun updateJar(instanceId: String, uri: Uri) {
+        val instance = container.instances.get(instanceId)
+        if (instance == null) {
+            showMessage("Instance not found.", true)
+            return
+        }
+        if (container.server.hasActiveSession(instanceId) ||
+            _state.value.runtimeFor(instanceId).isActive
+        ) {
+            showMessage("Stop the server before updating its JAR file.", true)
+            return
+        }
+        viewModelScope.launch {
+            persistReadPermission(uri)
+            var tempJar: File? = null
+            try {
+                val displayName = queryDisplayName(uri) ?: "server.jar"
+                // Track the destination before copying so the finally always removes a
+                // partial file when the SAF stream fails or the coroutine is cancelled.
+                val dest = File(
+                    container.paths.downloadsDir,
+                    "jar-update-${System.currentTimeMillis()}-${sanitizeFileName(displayName)}"
+                )
+                tempJar = dest
+                withContext(Dispatchers.IO) { copyUriToFile(uri, dest) }
+                val source = dest
+                // Re-check right before replacing: the server may have been started
+                // while the picked file was being copied from SAF.
+                val result: Result<JarUpdateResult>? = withContext(Dispatchers.IO) {
+                    if (container.server.hasActiveSession(instanceId) ||
+                        _state.value.runtimeFor(instanceId).isActive
+                    ) {
+                        null
+                    } else {
+                        JarUpdater.update(container.paths.workingDir(instanceId), instance.jarFile, source)
+                    }
+                }
+                if (result == null) {
+                    showMessage("Stop the server before updating its JAR file.", true)
+                    return@launch
+                }
+                result.onSuccess { update ->
+                    // Keep the file name and JRE: only the detected metadata changes.
+                    container.instances.update(instanceId) {
+                        it.copy(
+                            kind = update.inspection.kind,
+                            flavor = update.inspection.flavor,
+                            minecraftVersion = update.inspection.minecraftVersion ?: it.minecraftVersion,
+                            lastCrashSummary = null
+                        )
+                    }
+                    // The old exit report belongs to the replaced JAR, not the new one.
+                    container.server.clearLastCrash(instanceId)
+                    _state.update { previous ->
+                        if (previous.lastCrashInstanceId == instanceId) {
+                            previous.copy(lastCrash = null, lastCrashInstanceId = null)
+                        } else {
+                            previous
+                        }
+                    }
+                    val version = update.inspection.minecraftVersion ?: "unknown"
+                    var message = "Server JAR updated (${update.inspection.label}, Minecraft $version). " +
+                        "Previous JAR kept as ${update.backupFileName ?: "—"}. Restart the server to use it."
+                    if (update.inspection.suggestedJreMajor > instance.jreMajor) {
+                        message += " Warning: the new JAR recommends Java " +
+                            "${update.inspection.suggestedJreMajor}; this instance uses Java " +
+                            "${instance.jreMajor}, so update the runtime before starting it."
+                    }
+                    showMessage(message)
+                }.onFailure { error ->
+                    showMessage("Could not update the server JAR: ${error.message}", true)
+                }
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                showMessage("Could not update the server JAR: ${error.message}", true)
+            } finally {
+                val leftover = tempJar
+                withContext(NonCancellable + Dispatchers.IO) { leftover?.delete() }
+            }
+        }
     }
 
     /* ------------------------------------------------------------------ */

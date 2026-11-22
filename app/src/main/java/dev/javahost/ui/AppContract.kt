@@ -136,6 +136,12 @@ interface AppActions {
     fun deleteInstance(id: String)
     fun updateInstance(instance: ServerInstance)
     fun renameInstance(id: String, name: String)
+    /**
+     * Replace the instance's server JAR with a user-picked file (SAF [uri]).
+     * The world, plugins/mods, settings and logs are kept; the previous JAR is
+     * kept as `<jar>.bak`. Rejected while that server is running.
+     */
+    fun updateJar(instanceId: String, uri: Uri)
 
     // --- lifecycle -------------------------------------------------------------
     /** Start one server (up to [dev.javahost.core.api.ServerController.MAX_RUNNING_SERVERS] may run). */

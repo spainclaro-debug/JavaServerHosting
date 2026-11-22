@@ -21,6 +21,7 @@ evidence), **Manual-only** (requires a physical device; see `TESTING.md`).
 | Detect by `META-INF/MANIFEST.MF` + class signatures (Bukkit/Paper/Fabric/Forge/net.minecraft) | Verified against real vanilla/Paper/WireMock/H2 jars | `core/jar/JarInspector.kt` |
 | Classify Minecraft vs Generic; manual override | Implemented | `JarInspection`, Create screen override chips |
 | Installer JARs flagged, not launched blindly | Implemented | `JarInspector` `needsInstaller` |
+| In-place server JAR update: `OpenDocument` picker, atomic replace keeping world/plugins/mods/`server.properties`/logs, single `<jar>.bak` rollback copy, re-inspection + metadata update with newer-Java warning, refused while that server is running | Verified (`JarUpdaterTest` hermetic: replace/`.bak`/path/same-file/installer/invalid-JAR rejections + failure rollback; UI wiring compile-checked) | `core/storage/JarUpdater.kt`, `ui/AppViewModel.kt` (`updateJar`), `ui/screens/ServerDetailScreen.kt` |
 
 ## Conditional features
 
